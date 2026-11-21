@@ -11,7 +11,17 @@ It only reads. No aim help, no wallhack, no automation: nothing in your game cha
 2. Open [survev-observer.user.js](https://raw.githubusercontent.com/17nbist/survev-observer/main/survev-observer.user.js). Tampermonkey shows the code and an Install button.
 3. Play survev.io as normal. A small "observer" label in the bottom left corner shows it is on. Click it to pause.
 
-It is one file of about 200 lines. Read it before you install it.
+## Death replay
+
+When you die, a "Death replay" button appears above the label. It opens the [clip jury](https://clip-jury.pages.dev/)'s replay page
+and shows your last 20 seconds: everyone your game could see, the player who killed you ringed in amber with their aim drawn, and
+the edge of your screen. "Save video" downloads it as a video (about 6 MB) you can post anywhere.
+
+The replay is made in your browser from what the script kept of the match (the last minute). It is handed to that page directly,
+not uploaded. Only for the replay, the script reads players' names from the game so the replay can show them; names stay in your
+browser and are never part of what is sent.
+
+It is one file of about 250 lines. Read it before you install it.
 
 ## What it sends
 

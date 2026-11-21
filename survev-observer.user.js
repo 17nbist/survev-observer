@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.2.0
+// @version      1.3.0
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
@@ -15,13 +15,17 @@
 //  2. Every time the game gets a world update from the server, it notes where every player your client can see is, where
 //     they face, what they hold and wear, and the bullets in the air. Once a match it notes the map's shape (coast, rivers). Players are numbers only (the game's own ids), never names.
 //  3. Every 10 seconds it zips those notes and sends them to https://survev-observer.pages.dev/api/upload.
+//  4. It also keeps the last minute of notes in memory. When you die, a "Death replay" button opens the clip jury's replay page and
+//     hands it those notes directly (nothing is uploaded for this). For the replay only, it reads the players' names from the game:
+//     they go to that page in your browser and nowhere else; they are never in what is uploaded.
 // It sends nothing about you beyond what is in the game (no name, no account, no browser data). The badge in the bottom left
 // corner shows that it is on and how much it sent; click it to pause or resume. See README.md for the full list.
 
 (function () {
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
-  const VERSION = 'observer-1.2.0', FLUSH_MS = 10000, KEEP = 60000, MSG_KILL = 7;
+  const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
+  const VERSION = 'observer-1.3.0', FLUSH_MS = 10000, KEEP = 60000, MSG_KILL = 7;
 
   // ---------- 1. find the game ----------
   // The game's main object is passed through Function.prototype.call once while it boots. We look at each call until we see
@@ -82,12 +86,16 @@
   const sess = Math.random().toString(36).slice(2, 12);
   let buf = [], match = 0, inMatch = false, myId = 0, watching = 0, lastUpdate = 0, wasDead = false, game = null;
   const strings = new Map(), obsSeen = new Map(), bulSeen = new WeakMap(), smokeSeen = new Map(); let infoSig = '';
-  const push = rec => { buf.push(rec); if (buf.length > KEEP) buf.splice(0, buf.length - KEEP); };
+  // rp: the current match's notes for the death replay. Everything that describes the match (map, names of things, obstacles, kills,
+  // smoke) is kept; moment-to-moment notes (updates, bullets, explosions, emotes, pings) only for the last minute
+  let rp = [], rpPruned = 0; const names = {}; const RP_KEEP = new Set(['M', 's', 'm', 'o', 'K', 'I', 'S', 'D', 'F', 'f', 'E']);
+  function prune(t) { if (t - rpPruned < 5000) return; rpPruned = t; rp = rp.filter(r => RP_KEEP.has(r[0]) || r[1] >= t - REPLAY_MS); }
+  const push = rec => { buf.push(rec); if (buf.length > KEEP) buf.splice(0, buf.length - KEEP); rp.push(rec); };
   const now = () => Math.round(performance.now());
   function str(s) { if (typeof s !== 'string' || !s) return 0; let i = strings.get(s); if (i === undefined) { i = strings.size + 1; strings.set(s, i); push(['s', i, s]); } return i; }
 
   function matchStart(g, me) {
-    inMatch = true; match++; myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = '';
+    inMatch = true; match++; myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = ''; rp = []; rpPruned = 0; died = false; for (const k in names) delete names[k]; replayBtn();
     strings.clear(); obsSeen.clear(); smokeSeen.clear(); for (const k of ['barn', 'me', 'map', 'obst', 'bul', 'smoke', 'net']) K[k] = null;
     const m = theMap(g);
     push(['M', now(), { map: m && m.mapName || null, seed: m && m.seed || 0, w: m && m.width || 0, h: m && m.height || 0, host: location.hostname, myId, cfg: { who: 'contrib', v: VERSION } }]);
@@ -140,10 +148,10 @@
     const lu = g.lastUpdateTime; if (typeof lu !== 'number' || lu === lastUpdate) return;
     const gap = lastUpdate ? lu - lastUpdate : 0; lastUpdate = lu; const t = now(); hookFx(g);
     if (me.__id !== watching && (me.__id !== myId || watching)) { watching = me.__id === myId ? 0 : me.__id; push(['S', t, watching]); }
-    if (watching && !wasDead) { wasDead = true; push(['D', t, 0, 0]); } // the game shows someone else once you are dead
+    if (watching && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; replayBtn(); } // the game shows someone else once you are dead
     // you (or the player you watch after you die), then everyone else in view
     const n = net(me), pos = me[K.pos] || { x: 0, y: 0 }, flags = (n.dead ? 1 : 0) | (n.downed ? 2 : 0) | (n.pan ? 8 : 0) | (n.heal ? 16 : 0) | (n.boost ? 32 : 0);
-    if (me.__id === myId && n.dead && !wasDead) { wasDead = true; push(['D', t, 0, 0]); }
+    if (me.__id === myId && n.dead && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; replayBtn(); }
     const meRec = [r2(pos.x), r2(pos.y), dir8(K.dir && me[K.dir]), me.layer | 0, 0, 0, 0, str(n.weap), 0, 0, 0, 0, 0, 0, str(n.helmet), str(n.chest), str(n.pack), 0, 0, n.anim | 0, n.action | 0, str(n.actItem), flags, 0, 0];
     const info = b.playerInfo || {}, mine = info[myId] || {}, players = [];
     for (const p of pool(b.playerPool)) {
@@ -153,6 +161,8 @@
         (q.dead ? 1 : 0) | (q.downed ? 2 : 0) | (mate ? 4 : 0) | (q.pan ? 8 : 0) | (q.heal ? 16 : 0) | (q.boost ? 32 : 0), q.anim | 0, q.action | 0, str(q.actItem), r2(typeof q.scale === 'number' ? q.scale : 1), str(q.outfit)]);
     }
     push(['u', t, Math.round(lu), 0, 0, Math.round(gap), meRec, players, null]);
+    for (const k of Object.keys(info)) { const nm = (info[k] || {}).name; if (typeof nm === 'string' && nm) names[k] = nm.slice(0, 24); } // for the replay tab only, never uploaded
+    prune(t);
     const ids = Object.keys(info), sig = ids.join(','); if (sig !== infoSig) { infoSig = sig; push(['I', t, ids.map(k => [+k, (info[k] || {}).teamId | 0, (info[k] || {}).groupId | 0])]); }
     // obstacles: once when first seen (with their shape), then only when they change (broken, door opened, damaged)
     for (const o of obstacles(g)) {
@@ -209,6 +219,24 @@
       el.onclick = () => { paused = !paused; try { localStorage.setItem('observer.paused', paused ? '1' : '0'); } catch (e) {} buf = []; inMatch = false; badge(); }; // a resume starts the match notes afresh
       document.body.appendChild(el); }
     el.textContent = 'observer ' + (paused ? 'paused (click to resume)' : (inMatch ? 'recording' : 'on') + ' · ' + (sentBytes / 1024).toFixed(0) + ' KB sent' + (lastError ? ' · ' + lastError : ''));
+  }
+
+  // ---------- the death replay button ----------
+  // Opens the replay page, waits for it to say it is ready, then hands it this match's notes and the names. The page only takes
+  // them from survev.io, and this only sends them to the clip jury's address.
+  let died = false, rbtn = null;
+  function replayBtn() {
+    if (!document.body) return;
+    if (!rbtn) { rbtn = document.createElement('div'); rbtn.textContent = '\u25B6 Death replay'; rbtn.title = 'watch your death again, and save it as a video';
+      rbtn.style.cssText = 'position:fixed;left:8px;bottom:34px;z-index:2147483647;font:600 13px system-ui,sans-serif;color:#fff;background:#b8452c;padding:6px 11px;border-radius:4px;cursor:pointer;user-select:none;box-shadow:0 1px 4px rgba(0,0,0,.4)';
+      rbtn.onclick = openReplay; document.body.appendChild(rbtn); }
+    rbtn.style.display = died && rp.length ? '' : 'none';
+  }
+  function openReplay() {
+    const lines = rp.slice(), nm = Object.assign({}, names), w = window.open(REPLAY + '/replay', '_blank'); if (!w) return;
+    const onMsg = ev => { if (ev.origin !== REPLAY || ev.source !== w || !ev.data || ev.data.observerReplayReady !== 1) return; window.removeEventListener('message', onMsg);
+      w.postMessage({ observerReplay: 1, lines, names: nm, player: myId }, REPLAY); };
+    window.addEventListener('message', onMsg); setTimeout(() => window.removeEventListener('message', onMsg), 30000);
   }
 
   function loop() { try { tick(); } catch (e) {} requestAnimationFrame(loop); }
