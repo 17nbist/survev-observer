@@ -28,7 +28,7 @@ It is one file of about 250 lines. Read it before you install it.
 Every 10 seconds, zipped, to `https://survev-observer.pages.dev/api/upload`:
 
 - the map and its buildings (once a match)
-- every game update: position, facing, weapon and gear of you and of the players on your screen
+- every game update: position, facing, weapon and gear of you and of the players on your screen; for you (or the player you watch after you die) also the scope and how far it lets you see
 - bullets when they appear, kills from the kill feed, explosions, emotes and map pings, obstacles (once, then when they break or a door
   opens), smoke
 - who you spectate after you die

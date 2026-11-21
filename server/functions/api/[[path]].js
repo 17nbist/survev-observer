@@ -1,9 +1,11 @@
 // survev observer's server (Cloudflare Pages Functions, D1 binding DB).
-//   POST /api/upload   one batch from the userscript (gzip or plain text, at most 2 MB). Rate limited per browser token and per
+//   POST /api/upload   one batch from the userscript (gzip or plain text, at most 600 KB: the script sends at most 1500 lines a batch,
+//                      about 200 KB zipped; 2 MB let one address store 120 MB a minute and 50 such rows broke the export). Rate limited per browser token and per
 //                      address; the address itself is never stored, only a salted hash used for the limit.
-//   GET  /api/export   (private: needs the EXPORT_KEY secret) batches after ?after=<id>, for the clip jury's puller
+//   GET  /api/export   (private: needs the EXPORT_KEY secret) batches after ?after=<id>, for the clip jury's puller: at most ?limit rows
+//                      and about 4 MB of bodies a page (always one row at least), so a page fits the Worker's memory whatever was uploaded
 //   POST /api/ack      (private) deletes batches up to {upto} once they are pulled
-const TOKEN = /^[a-f0-9-]{16,40}$/, MAX_BYTES = 2000000, PER_TOKEN_MIN = 12, PER_IP_MIN = 60, ORIGIN = 'https://survev.io';
+const TOKEN = /^[a-f0-9-]{16,40}$/, MAX_BYTES = 600000, EXPORT_BYTES = 4000000, PER_TOKEN_MIN = 12, PER_IP_MIN = 60, ORIGIN = 'https://survev.io';
 const cors = { 'Access-Control-Allow-Origin': ORIGIN, 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, X-Observer-Token, X-Observer-Encoding, X-Observer-Version', 'Access-Control-Max-Age': '86400' };
 const json = (o, status, extra) => new Response(JSON.stringify(o), { status: status || 200, headers: Object.assign({ 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }, extra || {}) });
 
@@ -35,7 +37,10 @@ export async function onRequest(ctx) {
     if (p === '/api/export' && request.method === 'GET') {
       if (!authed(request, env)) return json({ error: 'not found' }, 404);
       const after = +(url.searchParams.get('after') || 0), limit = Math.min(100, Math.max(1, +(url.searchParams.get('limit') || 50)));
-      const rows = (await env.DB.prepare('SELECT id, token, ts, enc, body FROM batches WHERE id > ? ORDER BY id LIMIT ?').bind(after, limit).all()).results || [];
+      // the sizes first, then only the bodies that fit the page's byte budget
+      const sizes = (await env.DB.prepare('SELECT id, size FROM batches WHERE id > ? ORDER BY id LIMIT ?').bind(after, limit).all()).results || []; if (!sizes.length) return json([]);
+      let upto = sizes[0].id, sum = 0; for (const s of sizes) { if (sum && sum + s.size > EXPORT_BYTES) break; sum += s.size; upto = s.id; }
+      const rows = (await env.DB.prepare('SELECT id, token, ts, enc, body FROM batches WHERE id > ? AND id <= ? ORDER BY id').bind(after, upto).all()).results || [];
       return json(rows.map(r => ({ id: r.id, token: r.token, ts: r.ts, enc: r.enc, body: b64(r.body) })));
     }
     if (p === '/api/ack' && request.method === 'POST') {

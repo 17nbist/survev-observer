@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.3.0
+// @version      1.3.2
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
@@ -15,7 +15,7 @@
 //  2. Every time the game gets a world update from the server, it notes where every player your client can see is, where
 //     they face, what they hold and wear, and the bullets in the air. Once a match it notes the map's shape (coast, rivers). Players are numbers only (the game's own ids), never names.
 //  3. Every 10 seconds it zips those notes and sends them to https://survev-observer.pages.dev/api/upload.
-//  4. It also keeps the last minute of notes in memory. When you die, a "Death replay" button opens the clip jury's replay page and
+//  4. It also keeps the last minute of notes in memory (and, once you die, the minute before your death). When you die, a "Death replay" button opens the clip jury's replay page and
 //     hands it those notes directly (nothing is uploaded for this). For the replay only, it reads the players' names from the game:
 //     they go to that page in your browser and nowhere else; they are never in what is uploaded.
 // It sends nothing about you beyond what is in the game (no name, no account, no browser data). The badge in the bottom left
@@ -25,7 +25,7 @@
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
   const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
-  const VERSION = 'observer-1.3.0', FLUSH_MS = 10000, KEEP = 60000, MSG_KILL = 7;
+  const VERSION = 'observer-1.3.2', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7; // BATCH: lines in one upload at most (the server takes 600 KB)
 
   // ---------- 1. find the game ----------
   // The game's main object is passed through Function.prototype.call once while it boots. We look at each call until we see
@@ -67,6 +67,14 @@
     if (!K.net || !ok(get(p, K.net))) K.net = findKey(p, ok); const n = K.net && p[K.net]; if (!n) return {}; const k = Object.keys(n);
     return { outfit: n[k[2]], pack: n[k[3]], helmet: n[k[4]], chest: n[k[5]], weap: n[k[6]], dead: n[k[8]], downed: n[k[9]], anim: n[k[10]], action: n[k[12]], pan: n[k[14]], heal: n[k[15]], boost: n[k[16]], actItem: n[k[22]], scale: n[k[23]] };
   }
+  // your own view: the server sends each client a small block about the player it shows (8 fields in a known order: health, view
+  // distance, boost, scope, ...). Two are read, the view distance and the scope's name, so a replay shows what was on your screen.
+  function local(p) {
+    const ok = v => { if (!v || typeof v !== 'object' || Array.isArray(v)) return false; const k = Object.keys(v);
+      return k.length === 8 && typeof v[k[0]] === 'number' && typeof v[k[1]] === 'number' && typeof v[k[2]] === 'number' && typeof v[k[3]] === 'string' && typeof v[k[4]] === 'number' && !!v[k[5]] && typeof v[k[5]] === 'object' && !Array.isArray(v[k[5]]) && Array.isArray(v[k[6]]) && typeof v[k[7]] === 'number'; };
+    if (!K.loc || !ok(get(p, K.loc))) K.loc = findKey(p, ok); const d = K.loc && p[K.loc]; if (!d) return { zoom: 0, scope: '' }; const k = Object.keys(d);
+    return { zoom: d[k[1]] > 0 && d[k[1]] < 500 ? d[k[1]] : 0, scope: /^\d+xscope$/.test(d[k[3]]) ? d[k[3]] : '' };
+  }
   const obstacles = g => { const m = theMap(g); if (!m) return []; if (!K.obst) K.obst = findKey(m, v => pool(v).some(o => o && typeof o.type === 'string' && isVec(o.pos))); return K.obst ? pool(m[K.obst]) : []; };
   const bullets = g => { if (!K.bul || !Array.isArray((get(g, K.bul) || {}).bullets)) K.bul = findKey(g, v => Array.isArray(v.bullets)); return K.bul ? g[K.bul].bullets : []; };
   // smoke: the barn with a numeric zIdx, an array and a pool (the renderer has zIdx and arrays too, but no pool)
@@ -88,15 +96,16 @@
   const strings = new Map(), obsSeen = new Map(), bulSeen = new WeakMap(), smokeSeen = new Map(); let infoSig = '';
   // rp: the current match's notes for the death replay. Everything that describes the match (map, names of things, obstacles, kills,
   // smoke) is kept; moment-to-moment notes (updates, bullets, explosions, emotes, pings) only for the last minute
-  let rp = [], rpPruned = 0; const names = {}; const RP_KEEP = new Set(['M', 's', 'm', 'o', 'K', 'I', 'S', 'D', 'F', 'f', 'E']);
+  // rpSnap: rp as it was 2 s after you died. The button hands that over, so the replay is whole however long you go on watching others
+  let rp = [], rpPruned = 0, rpSnap = null, diedAt = 0; const names = {}; const RP_KEEP = new Set(['M', 's', 'm', 'o', 'K', 'I', 'S', 'D', 'F', 'f', 'E']);
   function prune(t) { if (t - rpPruned < 5000) return; rpPruned = t; rp = rp.filter(r => RP_KEEP.has(r[0]) || r[1] >= t - REPLAY_MS); }
-  const push = rec => { buf.push(rec); if (buf.length > KEEP) buf.splice(0, buf.length - KEEP); rp.push(rec); };
+  const push = rec => { buf.push([match, rec]); if (buf.length > KEEP) buf.splice(0, buf.length - KEEP); rp.push(rec); }; // buf: [match number, note], so a batch never mixes two matches
   const now = () => Math.round(performance.now());
   function str(s) { if (typeof s !== 'string' || !s) return 0; let i = strings.get(s); if (i === undefined) { i = strings.size + 1; strings.set(s, i); push(['s', i, s]); } return i; }
 
   function matchStart(g, me) {
-    inMatch = true; match++; myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = ''; rp = []; rpPruned = 0; died = false; for (const k in names) delete names[k]; replayBtn();
-    strings.clear(); obsSeen.clear(); smokeSeen.clear(); for (const k of ['barn', 'me', 'map', 'obst', 'bul', 'smoke', 'net']) K[k] = null;
+    inMatch = true; match++; myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = ''; rp = []; rpPruned = 0; rpSnap = null; diedAt = 0; died = false; for (const k in names) delete names[k]; replayBtn();
+    strings.clear(); obsSeen.clear(); smokeSeen.clear(); for (const k of ['barn', 'me', 'map', 'obst', 'bul', 'smoke', 'net', 'loc']) K[k] = null;
     const m = theMap(g);
     push(['M', now(), { map: m && m.mapName || null, seed: m && m.seed || 0, w: m && m.width || 0, h: m && m.height || 0, host: location.hostname, myId, cfg: { who: 'contrib', v: VERSION } }]);
     const md = m && m.mapData;
@@ -148,11 +157,12 @@
     const lu = g.lastUpdateTime; if (typeof lu !== 'number' || lu === lastUpdate) return;
     const gap = lastUpdate ? lu - lastUpdate : 0; lastUpdate = lu; const t = now(); hookFx(g);
     if (me.__id !== watching && (me.__id !== myId || watching)) { watching = me.__id === myId ? 0 : me.__id; push(['S', t, watching]); }
-    if (watching && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; replayBtn(); } // the game shows someone else once you are dead
+    if (watching && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; diedAt = t; replayBtn(); } // the game shows someone else once you are dead
     // you (or the player you watch after you die), then everyone else in view
     const n = net(me), pos = me[K.pos] || { x: 0, y: 0 }, flags = (n.dead ? 1 : 0) | (n.downed ? 2 : 0) | (n.pan ? 8 : 0) | (n.heal ? 16 : 0) | (n.boost ? 32 : 0);
-    if (me.__id === myId && n.dead && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; replayBtn(); }
-    const meRec = [r2(pos.x), r2(pos.y), dir8(K.dir && me[K.dir]), me.layer | 0, 0, 0, 0, str(n.weap), 0, 0, 0, 0, 0, 0, str(n.helmet), str(n.chest), str(n.pack), 0, 0, n.anim | 0, n.action | 0, str(n.actItem), flags, 0, 0];
+    if (me.__id === myId && n.dead && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; diedAt = t; replayBtn(); }
+    const ld = local(me);
+    const meRec = [r2(pos.x), r2(pos.y), dir8(K.dir && me[K.dir]), me.layer | 0, 0, 0, 0, str(n.weap), 0, 0, 0, 0, 0, 0, str(n.helmet), str(n.chest), str(n.pack), str(ld.scope), r2(ld.zoom), n.anim | 0, n.action | 0, str(n.actItem), flags, 0, 0];
     const info = b.playerInfo || {}, mine = info[myId] || {}, players = [];
     for (const p of pool(b.playerPool)) {
       if (!p || !p.active || p.__id === me.__id) continue; const pp = p[K.pos]; if (!isVec(pp)) continue; const q = net(p), pi = info[p.__id] || {};
@@ -162,7 +172,7 @@
     }
     push(['u', t, Math.round(lu), 0, 0, Math.round(gap), meRec, players, null]);
     for (const k of Object.keys(info)) { const nm = (info[k] || {}).name; if (typeof nm === 'string' && nm) names[k] = nm.slice(0, 24); } // for the replay tab only, never uploaded
-    prune(t);
+    prune(t); if (died && !rpSnap && t - diedAt >= 2000) rpSnap = rp.slice();
     const ids = Object.keys(info), sig = ids.join(','); if (sig !== infoSig) { infoSig = sig; push(['I', t, ids.map(k => [+k, (info[k] || {}).teamId | 0, (info[k] || {}).groupId | 0])]); }
     // obstacles: once when first seen (with their shape), then only when they change (broken, door opened, damaged)
     for (const o of obstacles(g)) {
@@ -200,14 +210,18 @@
   }
   async function flush() {
     if (sending || !buf.length || paused) return; sending = true;
-    const lines = buf; buf = [];
-    const text = JSON.stringify(['B', sess, VERSION, match, Math.round(Date.now() - performance.now())]) + '\n' + lines.map(r => JSON.stringify(r)).join('\n') + '\n';
+    // one batch: notes of one match only (its number goes in the header; a late tail of the last match sent under the next match's
+    // number cost that match its start), and BATCH lines at most; the rest waits for the next send
+    const m0 = buf[0][0]; let k = 0; while (k < buf.length && k < BATCH && buf[k][0] === m0) k++;
+    const part = buf.splice(0, k);
+    const text = JSON.stringify(['B', sess, VERSION, m0, Math.round(Date.now() - performance.now())]) + '\n' + part.map(r => JSON.stringify(r[1])).join('\n') + '\n';
     try {
       const z = await zip(text);
       const res = await fetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Observer-Token': token, 'X-Observer-Encoding': z.enc, 'X-Observer-Version': VERSION }, body: z.body });
-      if (res.ok) { sentBytes += z.body.length; lastError = ''; } else { lastError = 'server said ' + res.status; if (res.status >= 500 || res.status === 429) buf = lines.concat(buf).slice(-KEEP); }
-    } catch (e) { lastError = 'offline'; buf = lines.concat(buf).slice(-KEEP); }
+      if (res.ok) { sentBytes += z.body.length; lastError = ''; } else { lastError = 'server said ' + res.status; if (res.status >= 500 || res.status === 429) buf = part.concat(buf).slice(-KEEP); }
+    } catch (e) { lastError = 'offline'; buf = part.concat(buf).slice(-KEEP); }
     sending = false; badge();
+    if (!lastError && buf.length && (buf.length >= BATCH || buf[0][0] !== match || !inMatch)) setTimeout(flush, 5500); // a backlog: the next part soon (the server takes 12 a minute)
   }
 
   // ---------- the badge ----------
@@ -233,7 +247,7 @@
     rbtn.style.display = died && rp.length ? '' : 'none';
   }
   function openReplay() {
-    const lines = rp.slice(), nm = Object.assign({}, names), w = window.open(REPLAY + '/replay', '_blank'); if (!w) return;
+    const lines = (rpSnap || rp).slice(), nm = Object.assign({}, names), w = window.open(REPLAY + '/replay', '_blank'); if (!w) return;
     const onMsg = ev => { if (ev.origin !== REPLAY || ev.source !== w || !ev.data || ev.data.observerReplayReady !== 1) return; window.removeEventListener('message', onMsg);
       w.postMessage({ observerReplay: 1, lines, names: nm, player: myId }, REPLAY); };
     window.addEventListener('message', onMsg); setTimeout(() => window.removeEventListener('message', onMsg), 30000);
