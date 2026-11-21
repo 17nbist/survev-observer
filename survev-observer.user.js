@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.1.0
+// @version      1.2.0
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
@@ -21,7 +21,7 @@
 (function () {
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
-  const VERSION = 'observer-1.1.0', FLUSH_MS = 10000, KEEP = 60000, MSG_KILL = 7;
+  const VERSION = 'observer-1.2.0', FLUSH_MS = 10000, KEEP = 60000, MSG_KILL = 7;
 
   // ---------- 1. find the game ----------
   // The game's main object is passed through Function.prototype.call once while it boots. We look at each call until we see
@@ -74,7 +74,8 @@
 
   // ---------- 2. the notes ----------
   // One JSON array per line, the same format the clip jury reads: M match start, m the map, u one world update (you and every
-  // player in view), b a bullet, o an obstacle, K a kill, F/f smoke, I team ids, S who you watch after you die, D your death,
+  // player in view), b a bullet, o an obstacle, K a kill, F/f smoke, X an explosion, e an emote, n a map ping, I team ids, S who you
+  // watch after you die, D your death,
   // E match end, s names (weapons, gear, obstacle types) as numbers.
   const r2 = v => (typeof v === 'number' ? Math.round(v * 100) / 100 : 0), r4 = v => (typeof v === 'number' ? Math.round(v * 1e4) / 1e4 : 0);
   const dir8 = d => (isVec(d) ? Math.round((Math.atan2(d.y, d.x) + Math.PI) / (2 * Math.PI) * 255) : 0);
@@ -118,6 +119,18 @@
     } catch (e) {}
   }
 
+  // explosions, emotes and map pings: the game's explosion and emote objects keep their method names; each call is noted, then passed
+  // on unchanged (the game draws them exactly as before)
+  const fxHooked = new WeakSet();
+  function hookFx(g) {
+    for (const k of keys(g)) { const v = get(g, k); if (!v || typeof v !== 'object' || fxHooked.has(v)) continue;
+      if (Array.isArray(v.explosions) && typeof v.addExplosion === 'function') { fxHooked.add(v); const o = v.addExplosion;
+        v.addExplosion = function (type, pos, layer) { try { if (inMatch && pos) push(['X', now(), str(type), r2(pos.x), r2(pos.y), layer | 0]); } catch (e) {} return o.apply(this, arguments); }; }
+      else if (Array.isArray(v.emotes) && typeof v.addEmote === 'function') { fxHooked.add(v); const oe = v.addEmote, op = v.addPing;
+        v.addEmote = function (em) { try { if (inMatch && em) push(['e', now(), em.playerId | 0, str(em.type)]); } catch (e) {} return oe.apply(this, arguments); };
+        if (typeof op === 'function') v.addPing = function (pg) { try { if (inMatch && pg && pg.pos) push(['n', now(), str(pg.type), r2(pg.pos.x), r2(pg.pos.y), pg.playerId | 0]); } catch (e) {} return op.apply(this, arguments); }; } }
+  }
+
   function tick() {
     const g = app && app.game;
     if (!g || !g.initialized) { if (inMatch) matchEnd(wasDead ? 'dead' : 'left'); game = g; return; }
@@ -125,7 +138,7 @@
     if (paused) return; // paused: nothing is noted and nothing is sent
     if (!inMatch || g !== game) { if (inMatch) matchEnd('left'); game = g; matchStart(g, me); }
     const lu = g.lastUpdateTime; if (typeof lu !== 'number' || lu === lastUpdate) return;
-    const gap = lastUpdate ? lu - lastUpdate : 0; lastUpdate = lu; const t = now();
+    const gap = lastUpdate ? lu - lastUpdate : 0; lastUpdate = lu; const t = now(); hookFx(g);
     if (me.__id !== watching && (me.__id !== myId || watching)) { watching = me.__id === myId ? 0 : me.__id; push(['S', t, watching]); }
     if (watching && !wasDead) { wasDead = true; push(['D', t, 0, 0]); } // the game shows someone else once you are dead
     // you (or the player you watch after you die), then everyone else in view
