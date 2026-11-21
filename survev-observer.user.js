@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.0.0
+// @version      1.1.0
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
@@ -13,7 +13,7 @@
 // What this does, in short:
 //  1. Waits for the game to start, and keeps a reference to it (it does not change it).
 //  2. Every time the game gets a world update from the server, it notes where every player your client can see is, where
-//     they face, what they hold, and the bullets in the air. Players are numbers only (the game's own ids), never names.
+//     they face, what they hold and wear, and the bullets in the air. Once a match it notes the map's shape (coast, rivers). Players are numbers only (the game's own ids), never names.
 //  3. Every 10 seconds it zips those notes and sends them to https://survev-observer.pages.dev/api/upload.
 // It sends nothing about you beyond what is in the game (no name, no account, no browser data). The badge in the bottom left
 // corner shows that it is on and how much it sent; click it to pause or resume. See README.md for the full list.
@@ -21,7 +21,7 @@
 (function () {
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
-  const VERSION = 'observer-1.0.0', FLUSH_MS = 10000, KEEP = 60000, MSG_KILL = 7;
+  const VERSION = 'observer-1.1.0', FLUSH_MS = 10000, KEEP = 60000, MSG_KILL = 7;
 
   // ---------- 1. find the game ----------
   // The game's main object is passed through Function.prototype.call once while it boots. We look at each call until we see
@@ -61,7 +61,7 @@
   function net(p) {
     const ok = v => { if (!v || typeof v !== 'object' || Array.isArray(v)) return false; const ks = Object.keys(v); return ks.length === 26 && isVec(v[ks[0]]) && Array.isArray(v[ks[25]]) && typeof v[ks[24]] === 'string' && typeof v[ks[8]] === 'boolean'; };
     if (!K.net || !ok(get(p, K.net))) K.net = findKey(p, ok); const n = K.net && p[K.net]; if (!n) return {}; const k = Object.keys(n);
-    return { pack: n[k[3]], helmet: n[k[4]], chest: n[k[5]], weap: n[k[6]], dead: n[k[8]], downed: n[k[9]], anim: n[k[10]], action: n[k[12]], pan: n[k[14]], heal: n[k[15]], boost: n[k[16]], actItem: n[k[22]], scale: n[k[23]] };
+    return { outfit: n[k[2]], pack: n[k[3]], helmet: n[k[4]], chest: n[k[5]], weap: n[k[6]], dead: n[k[8]], downed: n[k[9]], anim: n[k[10]], action: n[k[12]], pan: n[k[14]], heal: n[k[15]], boost: n[k[16]], actItem: n[k[22]], scale: n[k[23]] };
   }
   const obstacles = g => { const m = theMap(g); if (!m) return []; if (!K.obst) K.obst = findKey(m, v => pool(v).some(o => o && typeof o.type === 'string' && isVec(o.pos))); return K.obst ? pool(m[K.obst]) : []; };
   const bullets = g => { if (!K.bul || !Array.isArray((get(g, K.bul) || {}).bullets)) K.bul = findKey(g, v => Array.isArray(v.bullets)); return K.bul ? g[K.bul].bullets : []; };
@@ -91,7 +91,10 @@
     const m = theMap(g);
     push(['M', now(), { map: m && m.mapName || null, seed: m && m.seed || 0, w: m && m.width || 0, h: m && m.height || 0, host: location.hostname, myId, cfg: { who: 'contrib', v: VERSION } }]);
     const md = m && m.mapData;
-    if (md && Array.isArray(md.objects)) push(['m', now(), md.objects.map(o => [str(o.type), r2(o.pos && o.pos.x), r2(o.pos && o.pos.y), o.ori | 0, r2(o.scale)]), (md.places || []).map(p => [str(p.name), r2(p.pos && p.pos.x), r2(p.pos && p.pos.y)])]);
+    // the map's shape: coastline, grass edge, rivers (the game works them out from the seed), as flat x,y lists
+    const tr = m && m.terrain, flat = a => (Array.isArray(a) ? a.flatMap(p => [Math.round(p.x * 10) / 10, Math.round(p.y * 10) / 10]) : []);
+    const terrain = tr ? { shore: flat(tr.shore), grass: flat(tr.grass), rivers: (tr.rivers || []).map(r => ({ looped: r.looped ? 1 : 0, water: flat(r.waterPoly), bank: flat(r.shorePoly) })) } : null;
+    if (md && Array.isArray(md.objects)) push(['m', now(), md.objects.map(o => [str(o.type), r2(o.pos && o.pos.x), r2(o.pos && o.pos.y), o.ori | 0, r2(o.scale)]), (md.places || []).map(p => [str(p.name), r2(p.pos && p.pos.x), r2(p.pos && p.pos.y)]), terrain]);
     hookKills(g);
   }
   function matchEnd(why) { if (!inMatch) return; inMatch = false; push(['E', now(), why, 0, 0, null]); flush(); }
@@ -134,7 +137,7 @@
       if (!p || !p.active || p.__id === me.__id) continue; const pp = p[K.pos]; if (!isVec(pp)) continue; const q = net(p), pi = info[p.__id] || {};
       const mate = (mine.groupId > 0 && pi.groupId === mine.groupId) || (mine.teamId > 0 && pi.teamId === mine.teamId);
       players.push([p.__id, r2(pp.x), r2(pp.y), dir8(K.dir && p[K.dir]), p.layer | 0, str(q.weap), str(q.helmet), str(q.chest), str(q.pack),
-        (q.dead ? 1 : 0) | (q.downed ? 2 : 0) | (mate ? 4 : 0) | (q.pan ? 8 : 0) | (q.heal ? 16 : 0) | (q.boost ? 32 : 0), q.anim | 0, q.action | 0, str(q.actItem), r2(typeof q.scale === 'number' ? q.scale : 1)]);
+        (q.dead ? 1 : 0) | (q.downed ? 2 : 0) | (mate ? 4 : 0) | (q.pan ? 8 : 0) | (q.heal ? 16 : 0) | (q.boost ? 32 : 0), q.anim | 0, q.action | 0, str(q.actItem), r2(typeof q.scale === 'number' ? q.scale : 1), str(q.outfit)]);
     }
     push(['u', t, Math.round(lu), 0, 0, Math.round(gap), meRec, players, null]);
     const ids = Object.keys(info), sig = ids.join(','); if (sig !== infoSig) { infoSig = sig; push(['I', t, ids.map(k => [+k, (info[k] || {}).teamId | 0, (info[k] || {}).groupId | 0])]); }
