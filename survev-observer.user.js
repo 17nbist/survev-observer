@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.3.2
+// @version      1.3.3
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
@@ -25,7 +25,7 @@
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
   const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
-  const VERSION = 'observer-1.3.2', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7; // BATCH: lines in one upload at most (the server takes 600 KB)
+  const VERSION = 'observer-1.3.3', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7; // BATCH: lines in one upload at most (the server takes 600 KB)
 
   // ---------- 1. find the game ----------
   // The game's main object is passed through Function.prototype.call once while it boots. We look at each call until we see
@@ -239,12 +239,33 @@
   // Opens the replay page, waits for it to say it is ready, then hands it this match's notes and the names. The page only takes
   // them from survev.io, and this only sends them to the clip jury's address.
   let died = false, rbtn = null;
-  function replayBtn() {
+  // The button sits where the player looks after dying (owner, 2026-11-22: the corner one was "barely noticeable"): a big one under
+  // the game's own Play Again / Spectate buttons on the results panel (#ui-stats-options, which the game empties and rebuilds each
+  // time it shows), and one at the top of the spectate menu (#ui-spectate-buttons). The small corner one stays only while neither is
+  // on screen. Added next to the game's buttons, styled with the game's own button classes; nothing of the game's is changed.
+  const BIG = 'display:block;position:absolute;left:50%;transform:translateX(-50%);top:64px;width:330px;height:54px;line-height:54px;padding:0;' +
+    'font-size:22px;font-weight:700;letter-spacing:.3px;background:#d9512c;border-bottom:2px solid #9e3a1f;box-shadow:inset 0 -2px #9e3a1f,0 0 0 3px rgba(255,255,255,.85);' +
+    'pointer-events:auto;cursor:pointer;z-index:5;text-align:center;white-space:nowrap';
+  const shown = el => !!el && el.offsetParent !== null && getComputedStyle(el).visibility !== 'hidden';
+  function place(host, id, css, label) { // our button inside one of the game's button rows, made again if the game rebuilt the row
+    let b = document.getElementById(id); if (!host) return null;
+    if (!b || b.parentNode !== host) { if (b) b.remove(); b = document.createElement('a'); b.id = id; b.className = 'btn-darken menu-option'; b.textContent = label;
+      b.title = 'watch your death again, and save it as a video'; b.style.cssText = css; b.onclick = e => { e.preventDefault(); e.stopPropagation(); openReplay(); };
+      host.appendChild(b); }
+    return b;
+  }
+  function replayBtn() { try { replayBtnDo(); } catch (e) {} } // it runs inside the recording step: a page that is not the game's must never cost a line
+  function replayBtnDo() {
     if (!document.body) return;
+    const on = died && rp.length > 0, byId = typeof document.getElementById === 'function'; // no getElementById: only the corner button
+    const stats = on && byId ? place(document.getElementById('ui-stats-options'), 'observer-replay-stats', BIG, '\u25B6  WATCH YOUR DEATH REPLAY') : null;
+    const spect = on && byId ? place(document.getElementById('ui-spectate-buttons'), 'observer-replay-spect', 'display:block;background:#d9512c;color:#fff;font-weight:700;pointer-events:auto;margin-bottom:6px', '\u25B6 Death replay') : null;
+    if (!on && byId) for (const id of ['observer-replay-stats', 'observer-replay-spect']) { const b = document.getElementById(id); if (b) b.remove(); }
+    if (spect && spect.parentNode.firstChild !== spect) spect.parentNode.insertBefore(spect, spect.parentNode.firstChild); // first in the spectate menu
     if (!rbtn) { rbtn = document.createElement('div'); rbtn.textContent = '\u25B6 Death replay'; rbtn.title = 'watch your death again, and save it as a video';
-      rbtn.style.cssText = 'position:fixed;left:8px;bottom:34px;z-index:2147483647;font:600 13px system-ui,sans-serif;color:#fff;background:#b8452c;padding:6px 11px;border-radius:4px;cursor:pointer;user-select:none;box-shadow:0 1px 4px rgba(0,0,0,.4)';
+      rbtn.style.cssText = 'position:fixed;left:8px;bottom:34px;z-index:2147483647;font:700 16px system-ui,sans-serif;color:#fff;background:#d9512c;padding:9px 15px;border-radius:5px;cursor:pointer;user-select:none;box-shadow:0 1px 6px rgba(0,0,0,.5)';
       rbtn.onclick = openReplay; document.body.appendChild(rbtn); }
-    rbtn.style.display = died && rp.length ? '' : 'none';
+    rbtn.style.display = on && !shown(stats) && !shown(spect) ? '' : 'none';
   }
   function openReplay() {
     const lines = (rpSnap || rp).slice(), nm = Object.assign({}, names), w = window.open(REPLAY + '/replay', '_blank'); if (!w) return;
@@ -257,4 +278,5 @@
   requestAnimationFrame(loop);
   setInterval(() => { flush(); badge(); }, FLUSH_MS);
   setInterval(badge, 2000);
+  setInterval(() => { try { replayBtn(); } catch (e) {} }, 400); // the game rebuilds its results panel each time it shows it
 })();
