@@ -7,9 +7,12 @@ It only reads. No aim help, no wallhack, no automation: nothing in your game cha
 
 ## Install
 
+Step by step with pictures: [guide/GUIDE.md](guide/GUIDE.md).
+
 1. Install [Tampermonkey](https://www.tampermonkey.net/) in your browser.
-2. Open [survev-observer.user.js](https://raw.githubusercontent.com/17nbist/survev-observer/main/survev-observer.user.js). Tampermonkey shows the code and an Install button.
-3. Play survev.io as normal. A small "observer" label in the bottom left corner shows it is on. Click it to pause.
+2. Chrome and Edge: on Tampermonkey's extension details page, switch on **Allow User Scripts**. Without it the script installs but never runs.
+3. Open [survev-observer.user.js](https://raw.githubusercontent.com/17nbist/survev-observer/main/survev-observer.user.js). Tampermonkey shows the code and an Install button.
+4. Play survev.io as normal. A small "observer" label in the bottom left corner shows it is on. Click it to pause.
 
 ## Death replay (the killcam, from 1.4.0)
 
