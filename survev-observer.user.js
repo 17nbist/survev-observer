@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.3.5
-// @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters. It changes nothing in your game.
+// @version      1.4.0
+// @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters, and replays your death through the game itself. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
 // @grant        none
@@ -15,9 +15,11 @@
 //  2. Every time the game gets a world update from the server, it notes where every player your client can see is, where
 //     they face, what they hold and wear, and the bullets in the air. Once a match it notes the map's shape (coast, rivers). Players are numbers only (the game's own ids), never names.
 //  3. Every 10 seconds it zips those notes and sends them to https://survev-observer.pages.dev/api/upload.
-//  4. It also keeps the last minute of notes in memory (and, once you die, the minute before your death). When you die, a "Death replay" button opens the clip jury's replay page and
-//     hands it those notes directly (nothing is uploaded for this). For the replay only, it reads the players' names from the game:
-//     they go to that page in your browser and nowhere else; they are never in what is uploaded.
+//  4. It keeps a copy of what the server sends your game during the match (the game's socket, about 3 KB a second), in this tab
+//     only: it is never uploaded. When you die, a "Death replay" button opens survev.io in a new tab, where the game's own client
+//     plays that copy back: your death drawn by the game itself, exactly as you saw it (the killcam, part 0 below). Without a copy
+//     (the observer started after the match did) the button opens the clip jury's map replay instead, handing it this match's notes
+//     and the players' names directly: they go to that page in your browser and nowhere else; they are never in what is uploaded.
 //  5. Only if you are signed in to a survev.io account: once a match is over it asks survev.io for your own match history (the list on
 //     your stats page) and finds that match's game id, and sends that id. A report to the game's moderators needs it. Your account's
 //     name is used for that one question to survev.io and is never sent to us; but the game id points at the game's public stats page,
@@ -29,7 +31,33 @@
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
   const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
-  const VERSION = 'observer-1.3.5', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7; // BATCH: lines in one upload at most (the server takes 600 KB)
+  const VERSION = 'observer-1.4.0', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7; // BATCH: lines in one upload at most (the server takes 600 KB)
+
+  // ---------- 0. a copy of the game's socket, and the killcam ----------
+  // The approach of "Surviv.io input replay recorder" (greasyfork.org/scripts/447501, MIT, by garlic, samer kizi and preacher):
+  // the page's WebSocket becomes a subclass that keeps every binary message the server sends to the game's socket (/play), with
+  // its time. It changes, delays and sends nothing: the game gets each message exactly as before, and the copy never leaves this
+  // tab. The Death replay button hands it to a killcam tab (killcam() below), where the game's own client plays it back.
+  const NativeWS = typeof window.WebSocket === 'function' ? window.WebSocket : null, KC_URL = 'wss://vb-killcam.invalid/play', KC_BEFORE = 20000, KC_AFTER = 2000, WIRE_MAX = 64e6;
+  // a killcam tab is known by its link alone: ?u= is the stand-in address (never a #hash, which the game reads as a team to join)
+  const KILLCAM = (() => { try { const u = new URLSearchParams(location.search).get('u'); return !!u && atob(u) === KC_URL; } catch (e) { return false; } })();
+  let wire = null; // the game socket of this match: {url, openEpoch, t0, frames: [[performance.now(), ArrayBuffer]], bytes}
+  if (!KILLCAM && NativeWS) {
+    try {
+      class ObserverWS extends NativeWS {
+        constructor(url, protocols) {
+          if (protocols === undefined) super(url); else super(url, protocols);
+          try {
+            if (/\/play(?:[?#]|$)/.test(String(url))) {
+              const rec = wire = { url: String(url), openEpoch: Date.now(), t0: performance.now(), frames: [], bytes: 0 };
+              this.addEventListener('message', e => { const d = e.data; if (d instanceof ArrayBuffer && rec.bytes < WIRE_MAX) { rec.frames.push([performance.now(), d]); rec.bytes += d.byteLength; } });
+            }
+          } catch (e) {}
+        }
+      }
+      window.WebSocket = ObserverWS;
+    } catch (e) {}
+  }
 
   // ---------- 1. find the game ----------
   // The game's main object is passed through Function.prototype.call once while it boots. We look at each call until we see
@@ -42,6 +70,90 @@
     return Reflect.apply(origCall, this, arguments);
   };
   setTimeout(() => { if (Function.prototype.call !== origCall) Function.prototype.call = origCall; }, 60000);
+
+  if (KILLCAM) { killcam(); return; } // a killcam tab only plays a replay: nothing below (notes, uploads, the badge) runs in it
+
+  // ---------- 0b. the killcam tab ----------
+  // The Death replay button opens survev.io/?u=<the stand-in address>&jt=vb. The game's own client starts there as it
+  // always does and joins the address in the link (main.ts tryJoinGameFromParam: no matchmaking request is made), which is the
+  // stand-in below: it hands the client what the server sent your game in that match, in order. Everything before the last 20 s
+  // goes at once behind a cover (each world update builds on the ones before, so none can be left out), the 3 s before them at 4x so
+  // the effects of the fast part die out, then the rest on its own clock. The client draws it as it did live: your view, your HUD,
+  // the doors, the kill feed. Nothing goes to any server from this tab: what the client sends is dropped, the stand-in address
+  // (.invalid) can never connect anywhere, a real game cannot be joined here, and no notes are kept or sent.
+  function killcam() {
+    const KC = { sock: null, data: null, started: false, bursting: false, playing: true, speed: 1, user: 1, vt: 0, base: 0, i: 0, from: 0, to: 0, done: false, ui: null };
+    // the game's settings are read here, never written; your facing comes from the recording, not this tab's mouse (local rotation off)
+    try { const SPr = Storage.prototype, gi = SPr.getItem, si = SPr.setItem;
+      SPr.getItem = function (k) { const v = gi.call(this, k); if (k !== 'surviv_config' || this !== window.localStorage) return v; try { const c = JSON.parse(v || '{}'); c.localRotation = false; return JSON.stringify(c); } catch (e) { return v; } };
+      SPr.setItem = function (k, v) { if (k === 'surviv_config' && this === window.localStorage) return; return si.call(this, k, v); }; } catch (e) {}
+    // the page's frame clock runs at the replay's speed and stops while paused, so the game's own motion slows and stops with it
+    // (the greasyfork recorder's slow motion)
+    const raf = window.requestAnimationFrame.bind(window); let rl = null, rv = 0;
+    window.requestAnimationFrame = cb => raf(ts => { if (rl === null) { rl = ts; rv = ts; } rv += (ts - rl) * (KC.started && !KC.bursting ? (KC.playing ? KC.speed : 0) : 1); rl = ts; return cb(rv); });
+    function WS(url, protocols) {
+      if (String(url) !== KC_URL) { if (/\/play(?:[?#]|$)/.test(String(url))) throw new Error('a killcam tab joins no real game'); return protocols === undefined ? new NativeWS(url) : new NativeWS(url, protocols); }
+      this.url = KC_URL; this.readyState = 0; this.binaryType = 'blob'; this.bufferedAmount = 0; this.protocol = ''; this.extensions = '';
+      this.onopen = this.onmessage = this.onclose = this.onerror = null; KC.sock = this; setTimeout(start, 0);
+    }
+    WS.prototype.send = function () {}; // the game's join and inputs go nowhere
+    WS.prototype.close = function () { this.readyState = 3; };
+    WS.prototype.addEventListener = WS.prototype.removeEventListener = function () {};
+    WS.CONNECTING = 0; WS.OPEN = 1; WS.CLOSING = 2; WS.CLOSED = 3;
+    if (NativeWS) window.WebSocket = WS;
+    // the copy comes from the tab that opened this one (same site only), asked for until it arrives
+    window.addEventListener('message', ev => { const d = ev.data; if (ev.origin !== location.origin || !window.opener || ev.source !== window.opener || !d || d.vbKillcam !== 1 || KC.data || !Array.isArray(d.frames)) return; KC.data = d; start(); });
+    const ask = () => { try { if (window.opener && !KC.data) window.opener.postMessage({ vbKillcamReady: 1 }, location.origin); } catch (e) {} };
+    ask(); const askT = setInterval(() => { if (KC.data) clearInterval(askT); else ask(); }, 1000); setTimeout(() => { clearInterval(askT); if (!KC.data) bar('no replay arrived: open it from the Death replay button'); }, 30000);
+    function start() {
+      if (KC.started || !KC.sock || !KC.data) return; KC.started = true;
+      const s = KC.sock, D = KC.data, F = D.frames, last = F.length ? F[F.length - 1][0] : 0, first = F.length ? F[0][0] : 0;
+      KC.from = Math.min(last, Math.max(first, +D.from || first)); KC.to = Math.max(KC.from, Math.min(last, D.to == null ? last : +D.to)); const pre = Math.max(first, KC.from - 3000);
+      s.readyState = 1; try { s.onopen && s.onopen({ type: 'open' }); } catch (e) {}
+      const am = app && app.audioManager, wasMute = !!(am && am.mute), mute = m => { try { if (am && typeof am.setMute === 'function') am.setMute(m || wasMute); } catch (e) {} };
+      const give = ab => { if (s.readyState === 1 && s.onmessage) try { s.onmessage({ data: ab, type: 'message' }); } catch (e) {} };
+      KC.bursting = true; mute(true); bar();
+      const burst = () => { const stop = performance.now() + 30; while (KC.i < F.length && F[KC.i][0] < pre && performance.now() < stop) give(F[KC.i++][1]); bar();
+        if (KC.i < F.length && F[KC.i][0] < pre) { setTimeout(burst, 0); return; }
+        KC.bursting = false; KC.speed = 4; KC.vt = pre; KC.base = performance.now(); pump(); };
+      const pump = () => { const now = performance.now(); if (KC.playing) KC.vt += (now - KC.base) * KC.speed; KC.base = now;
+        if (KC.speed === 4 && KC.vt >= KC.from) { KC.vt = KC.from; KC.speed = KC.user; mute(false); } // the last 20 s: unmuted, uncovered, at the chosen speed
+        if (KC.vt > KC.to) KC.vt = KC.to;
+        while (KC.i < F.length && F[KC.i][0] <= KC.vt) give(F[KC.i++][1]);
+        KC.done = KC.vt >= KC.to; bar(); if (!KC.done) setTimeout(pump, 8); };
+      setTimeout(burst, 50);
+    }
+    // the bar: where in the replay, pause, speed, from the start again, and the copy saved as a capture file (anticheat/wire's
+    // w-*.bin, which anticheat/wire/serve.mjs plays to the game's client); a cover over the game while it catches up
+    function bar(note) {
+      if (!document.body) return; const D = KC.data;
+      if (!KC.ui) { const u = KC.ui = {}; u.cover = document.createElement('div'); u.cover.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:#0d1117;color:#fff;display:flex;align-items:center;justify-content:center;font:700 22px system-ui,sans-serif';
+        u.box = document.createElement('div'); u.box.style.cssText = 'position:fixed;left:50%;top:8px;transform:translateX(-50%);z-index:2147483647;display:flex;gap:6px;align-items:center;background:rgba(0,0,0,.72);color:#fff;font:700 14px system-ui,sans-serif;padding:6px 10px;border-radius:6px;user-select:none';
+        const btn = (t, f) => { const b = document.createElement('button'); b.textContent = t; b.style.cssText = 'font:700 13px system-ui,sans-serif;color:#fff;background:#3a3f47;border:0;border-radius:4px;padding:4px 9px;cursor:pointer'; b.onclick = e => { e.preventDefault(); e.stopPropagation(); f(b); }; u.box.appendChild(b); return b; };
+        u.title = document.createElement('span'); u.title.textContent = 'KILLCAM'; u.title.style.color = '#ff8a65'; u.box.appendChild(u.title);
+        u.play = btn('Pause', () => { KC.playing = !KC.playing; KC.base = performance.now(); bar(); });
+        u.sp = [0.25, 0.5, 1, 2].map(x => btn(x + 'x', () => { KC.user = x; if (KC.speed !== 4) KC.speed = x; KC.base = performance.now(); bar(); }));
+        btn('Restart', () => location.reload());
+        btn('Save capture', () => save());
+        u.time = document.createElement('span'); u.time.style.cssText = 'min-width:84px;text-align:right;font-variant-numeric:tabular-nums'; u.box.appendChild(u.time);
+        document.body.appendChild(u.cover); document.body.appendChild(u.box); }
+      const u = KC.ui, catching = !KC.started || KC.bursting || KC.speed === 4;
+      u.cover.style.display = catching ? 'flex' : 'none';
+      u.cover.textContent = note || (!D ? 'waiting for the replay...' : 'loading your death replay... ' + Math.round(100 * KC.i / Math.max(1, D.frames.length)) + '%');
+      u.play.textContent = KC.done ? 'Done' : KC.playing ? 'Pause' : 'Play';
+      u.sp.forEach((b, k) => { b.style.background = [0.25, 0.5, 1, 2][k] === KC.user ? '#d9512c' : '#3a3f47'; });
+      if (D && D.death != null) { const r = (KC.vt - D.death) / 1000; u.time.textContent = (r < 0 ? '-' : '+') + Math.abs(r).toFixed(1) + ' s'; }
+    }
+    function save() {
+      const D = KC.data; if (!D) return; const F = D.frames, t0 = F.length ? F[0][0] : 0; let n = 0; for (const f of F) n += 9 + f[1].byteLength;
+      const out = new Uint8Array(n), dv = new DataView(out.buffer); let o = 0;
+      for (const f of F) { dv.setUint32(o, Math.max(0, Math.round(f[0] - t0)) >>> 0, true); dv.setUint8(o + 4, 0); dv.setUint32(o + 5, f[1].byteLength, true); out.set(new Uint8Array(f[1]), o + 9); o += 9 + f[1].byteLength; }
+      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([out], { type: 'application/octet-stream' })); a.download = 'w-' + Math.round(D.openEpoch || Date.now()) + '-killcam.bin';
+      document.body.appendChild(a); a.click(); a.remove();
+    }
+    const tick = () => { if (document.body) bar(); else setTimeout(tick, 50); }; tick();
+    window.__killcam = KC; // tools/test-observer-killcam.js reads where the replay is
+  }
 
   // The shipped game renames most of its fields, so they are found by what they look like. Keys are remembered, never the
   // objects: the game builds new ones every match.
@@ -101,14 +213,14 @@
   // rp: the current match's notes for the death replay. Everything that describes the match (map, names of things, obstacles, kills,
   // smoke) is kept; moment-to-moment notes (updates, bullets, explosions, emotes, pings) only for the last minute
   // rpSnap: rp as it was 2 s after you died. The button hands that over, so the replay is whole however long you go on watching others
-  let rp = [], rpPruned = 0, rpSnap = null, diedAt = 0; const names = {}; const RP_KEEP = new Set(['M', 's', 'm', 'o', 'K', 'I', 'S', 'D', 'F', 'f', 'E']);
+  let rp = [], rpPruned = 0, rpSnap = null, wireSnap = null, diedAt = 0; const names = {}; const RP_KEEP = new Set(['M', 's', 'm', 'o', 'K', 'I', 'S', 'D', 'F', 'f', 'E']);
   function prune(t) { if (t - rpPruned < 5000) return; rpPruned = t; rp = rp.filter(r => RP_KEEP.has(r[0]) || r[1] >= t - REPLAY_MS); }
   const push = rec => { buf.push([match, rec]); if (buf.length > KEEP) buf.splice(0, buf.length - KEEP); rp.push(rec); }; // buf: [match number, note], so a batch never mixes two matches
   const now = () => Math.round(performance.now());
   function str(s) { if (typeof s !== 'string' || !s) return 0; let i = strings.get(s); if (i === undefined) { i = strings.size + 1; strings.set(s, i); push(['s', i, s]); } return i; }
 
   function matchStart(g, me) {
-    inMatch = true; match++; startT = now(); myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = ''; rp = []; rpPruned = 0; rpSnap = null; diedAt = 0; died = false; for (const k in names) delete names[k]; replayBtn();
+    inMatch = true; match++; startT = now(); myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = ''; rp = []; rpPruned = 0; rpSnap = null; wireSnap = null; diedAt = 0; died = false; for (const k in names) delete names[k]; replayBtn();
     strings.clear(); obsSeen.clear(); smokeSeen.clear(); for (const k of ['barn', 'me', 'map', 'obst', 'bul', 'smoke', 'net', 'loc']) K[k] = null;
     const m = theMap(g);
     push(['M', now(), { map: m && m.mapName || null, seed: m && m.seed || 0, w: m && m.width || 0, h: m && m.height || 0, host: location.hostname, myId, cfg: { who: 'contrib', v: VERSION } }]);
@@ -176,7 +288,7 @@
     }
     push(['u', t, Math.round(lu), 0, 0, Math.round(gap), meRec, players, null]);
     for (const k of Object.keys(info)) { const nm = (info[k] || {}).name; if (typeof nm === 'string' && nm) names[k] = nm.slice(0, 24); } // for the replay tab only, never uploaded
-    prune(t); if (died && !rpSnap && t - diedAt >= 2000) rpSnap = rp.slice();
+    prune(t); if (died && !rpSnap && t - diedAt >= 2000) { rpSnap = rp.slice(); wireSnap = wireCut(); }
     const ids = Object.keys(info), sig = ids.join(','); if (sig !== infoSig) { infoSig = sig; push(['I', t, ids.map(k => [+k, (info[k] || {}).teamId | 0, (info[k] || {}).groupId | 0])]); }
     // obstacles: once when first seen (with their shape), then only when they change (broken, door opened, damaged)
     for (const o of obstacles(g)) {
@@ -325,7 +437,7 @@
   function place(host, id, css, label) { // our button inside one of the game's button rows, made again if the game rebuilt the row
     let b = document.getElementById(id); if (!host) return null;
     if (!b || b.parentNode !== host) { if (b) b.remove(); b = document.createElement('a'); b.id = id; b.className = 'btn-darken menu-option'; b.textContent = label;
-      b.title = 'watch your death again, and save it as a video'; b.style.cssText = css; b.onclick = e => { e.preventDefault(); e.stopPropagation(); openReplay(); };
+      b.title = 'watch your death again, drawn by the game itself'; b.style.cssText = css; b.onclick = e => { e.preventDefault(); e.stopPropagation(); openKillcam(); };
       host.appendChild(b); }
     return b;
   }
@@ -337,9 +449,9 @@
     const spect = on && byId ? place(document.getElementById('ui-spectate-buttons'), 'observer-replay-spect', 'display:block;background:#d9512c;color:#fff;font-weight:700;pointer-events:auto;margin-bottom:6px', '\u25B6 Death replay') : null;
     if (!on && byId) for (const id of ['observer-replay-stats', 'observer-replay-spect']) { const b = document.getElementById(id); if (b) b.remove(); }
     if (spect && spect.parentNode.firstChild !== spect) spect.parentNode.insertBefore(spect, spect.parentNode.firstChild); // first in the spectate menu
-    if (!rbtn) { rbtn = document.createElement('div'); rbtn.textContent = '\u25B6 Death replay'; rbtn.title = 'watch your death again, and save it as a video';
+    if (!rbtn) { rbtn = document.createElement('div'); rbtn.textContent = '\u25B6 Death replay'; rbtn.title = 'watch your death again, drawn by the game itself';
       rbtn.style.cssText = 'position:fixed;left:8px;bottom:34px;z-index:2147483647;font:700 16px system-ui,sans-serif;color:#fff;background:#d9512c;padding:9px 15px;border-radius:5px;cursor:pointer;user-select:none;box-shadow:0 1px 6px rgba(0,0,0,.5)';
-      rbtn.onclick = openReplay; document.body.appendChild(rbtn); }
+      rbtn.onclick = openKillcam; document.body.appendChild(rbtn); }
     rbtn.style.display = on && !shown(stats) && !shown(spect) ? '' : 'none';
   }
   function openReplay() {
@@ -348,6 +460,22 @@
       w.postMessage({ observerReplay: 1, lines, names: nm, player: myId }, REPLAY); };
     window.addEventListener('message', onMsg); setTimeout(() => window.removeEventListener('message', onMsg), 30000);
   }
+
+  // The killcam (part 0): the copy of this match's socket as it was 2 s after your death goes to a new survev.io tab, which asks for
+  // it once it has loaded (and again after its Restart). Copies of the messages are handed over, never the ones the game holds.
+  const kcSnap = new Map();
+  const wireCut = () => { const w = wire; if (!w || !w.frames.length) return null; return { url: w.url, openEpoch: w.openEpoch, t0: w.t0, frames: w.frames.slice(), death: diedAt, me: myId }; };
+  window.addEventListener('message', ev => { const d = ev.data, s = kcSnap.get(ev.source); if (ev.origin !== location.origin || !s || !d || d.vbKillcamReady !== 1) return;
+    const frames = s.frames.map(f => [f[0] - s.t0, f[1].slice(0)]), death = s.death - s.t0;
+    ev.source.postMessage({ vbKillcam: 1, url: s.url, openEpoch: s.openEpoch, frames, death, from: death - KC_BEFORE, to: death + KC_AFTER, me: s.me }, location.origin, frames.map(f => f[1])); });
+  function openKillcam() {
+    const s = wireSnap || (died ? wireCut() : null);
+    if (!s || !s.frames.length || !s.death) { openReplay(); return; } // no copy of this match's socket (the observer started after it opened): the map replay
+    const w = window.open(location.origin + '/?u=' + encodeURIComponent(btoa(KC_URL)) + '&jt=vb', '_blank'); if (!w) return;
+    kcSnap.set(w, s); while (kcSnap.size > 3) kcSnap.delete(kcSnap.keys().next().value);
+  }
+  window.__observerWire = () => (wire ? { n: wire.frames.length, bytes: wire.bytes, url: wire.url } : null); // the same test: how much of the socket is copied
+  window.__observerKillcam = () => { const s = wireCut(); if (s) { s.death = Math.round(performance.now()); wireSnap = s; died = true; } openKillcam(); }; // tools/test-observer-killcam.js: the killcam without dying
 
   function loop() { try { tick(); } catch (e) {} requestAnimationFrame(loop); }
   requestAnimationFrame(loop);

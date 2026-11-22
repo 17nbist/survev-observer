@@ -11,17 +11,25 @@ It only reads. No aim help, no wallhack, no automation: nothing in your game cha
 2. Open [survev-observer.user.js](https://raw.githubusercontent.com/17nbist/survev-observer/main/survev-observer.user.js). Tampermonkey shows the code and an Install button.
 3. Play survev.io as normal. A small "observer" label in the bottom left corner shows it is on. Click it to pause.
 
-## Death replay
+## Death replay (the killcam, from 1.4.0)
 
-When you die, a "Death replay" button appears above the label. It opens the [clip jury](https://clip-jury.pages.dev/)'s replay page
-and shows your last 20 seconds: everyone your game could see, the player who killed you ringed in amber with their aim drawn, and
-the edge of your screen. "Save video" downloads it as a video (about 6 MB) you can post anywhere.
+When you die, a "Death replay" button appears (under Play Again, at the top of the spectate menu, or above the label). It opens
+survev.io in a new tab and plays your last 20 seconds back through the game's own client: your screen exactly as you saw it, your
+HUD, the doors, the kill feed, drawn by the game itself. The bar at the top pauses it, changes the speed (0.25x to 2x), starts it
+again, and saves it as a capture file.
 
-The replay is made in your browser from what the script kept of the match (the last minute). It is handed to that page directly,
-not uploaded. Only for the replay, the script reads players' names from the game so the replay can show them; names stay in your
-browser and are never part of what is sent.
+How: the script keeps a copy of what the server sends your game (about 3 KB a second, in that tab only, never uploaded). The replay
+tab's game plays that copy instead of joining a server, so it sends nothing anywhere. Player names are in the copy, since the
+server sends them to everyone; they stay in your browser.
 
-It is one file of about 350 lines. Read it before you install it.
+The idea comes from [Surviv.io input replay recorder](https://greasyfork.org/scripts/447501) by garlic, samer kizi and preacher
+(MIT), which records the game's socket the same way.
+
+Without a copy (you installed or turned on the script after the match started), the button opens the
+[clip jury](https://clip-jury.pages.dev/)'s map replay instead, made from the script's notes of the last minute: everyone your game
+could see, the player who killed you ringed, and "Save video".
+
+It is one file of about 500 lines. Read it before you install it.
 
 ## What it sends
 
@@ -66,6 +74,7 @@ name. If you do not want that, sign out of survev.io or pause the script (click 
 1. It waits for the game to start and keeps a reference to it. The game's main object passes through `Function.prototype.call` once while it loads; the script spots it there and puts `Function.prototype.call` back.
 2. The game renames its fields when it is built, so the script finds what it needs by shape (a list of players, an object with four position fields, and so on) and remembers the names.
 3. On each world update from the server, it writes one line of numbers. Every 10 seconds it zips the lines and sends them.
+4. It keeps a copy of the game socket's messages for the killcam (part 0 of the file); it never sends that copy.
 
 `server/` is the upload endpoint (Cloudflare Pages Functions and a D1 table). Batches stay there until they are pulled into the
 clip jury's data, then they are deleted.
