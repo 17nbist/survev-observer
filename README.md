@@ -15,8 +15,8 @@ It only reads. No aim help, no wallhack, no automation: nothing in your game cha
 
 When you die, a "Death replay" button appears (under Play Again, at the top of the spectate menu, or above the label). It opens
 survev.io in a new tab and plays your last 20 seconds back through the game's own client: your screen exactly as you saw it, your
-HUD, the doors, the kill feed, drawn by the game itself. The bar at the top pauses it, changes the speed (0.25x to 2x), starts it
-again, and saves it as a capture file.
+HUD, the doors, the kill feed, drawn by the game itself. The bar at the top pauses it, changes the speed (0.25x to 2x) and starts it
+again. Save video records it with its sound and downloads a video file.
 
 How: the script keeps a copy of what the server sends your game (about 3 KB a second, in that tab only, never uploaded). The replay
 tab's game plays that copy instead of joining a server, so it sends nothing anywhere. Player names are in the copy, since the
