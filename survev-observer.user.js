@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.4.1
+// @version      1.4.2
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters, and replays your death through the game itself. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
@@ -31,7 +31,7 @@
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
   const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
-  const VERSION = 'observer-1.4.1', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
+  const VERSION = 'observer-1.4.2', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
 
   // ---------- 0. a copy of the game's socket, and the killcam ----------
   // The approach of "Surviv.io input replay recorder" (greasyfork.org/scripts/447501, MIT, by garlic, samer kizi and preacher):
@@ -199,16 +199,25 @@
   function net(p) {
     const ok = v => { if (!v || typeof v !== 'object' || Array.isArray(v)) return false; const ks = Object.keys(v); return ks.length === 26 && isVec(v[ks[0]]) && Array.isArray(v[ks[25]]) && typeof v[ks[24]] === 'string' && typeof v[ks[8]] === 'boolean'; };
     if (!K.net || !ok(get(p, K.net))) K.net = findKey(p, ok); const n = K.net && p[K.net]; if (!n) return {}; const k = Object.keys(n);
-    return { pos: n[k[0]], dir: n[k[1]], outfit: n[k[2]], pack: n[k[3]], helmet: n[k[4]], chest: n[k[5]], weap: n[k[6]], dead: n[k[8]], downed: n[k[9]], anim: n[k[10]], action: n[k[12]], pan: n[k[14]], heal: n[k[15]], boost: n[k[16]], actItem: n[k[22]], scale: n[k[23]] };
+    return { pos: n[k[0]], dir: n[k[1]], role: n[k[24]], perks: n[k[25]], outfit: n[k[2]], pack: n[k[3]], helmet: n[k[4]], chest: n[k[5]], weap: n[k[6]], dead: n[k[8]], downed: n[k[9]], anim: n[k[10]], action: n[k[12]], pan: n[k[14]], heal: n[k[15]], boost: n[k[16]], actItem: n[k[22]], scale: n[k[23]] };
   }
   // your own view: the server sends each client a small block about the player it shows (8 fields in a known order: health, view
   // distance, boost, scope, ...). Two are read, the view distance and the scope's name, so a replay shows what was on your screen.
+  // (1.4.2: also its health, boost, slot, inventory and weapons, for the replay's HUD)
   function local(p) {
     const ok = v => { if (!v || typeof v !== 'object' || Array.isArray(v)) return false; const k = Object.keys(v);
       return k.length === 8 && typeof v[k[0]] === 'number' && typeof v[k[1]] === 'number' && typeof v[k[2]] === 'number' && typeof v[k[3]] === 'string' && typeof v[k[4]] === 'number' && !!v[k[5]] && typeof v[k[5]] === 'object' && !Array.isArray(v[k[5]]) && Array.isArray(v[k[6]]) && typeof v[k[7]] === 'number'; };
-    if (!K.loc || !ok(get(p, K.loc))) K.loc = findKey(p, ok); const d = K.loc && p[K.loc]; if (!d) return { zoom: 0, scope: '' }; const k = Object.keys(d);
-    return { zoom: d[k[1]] > 0 && d[k[1]] < 500 ? d[k[1]] : 0, scope: /^\d+xscope$/.test(d[k[3]]) ? d[k[3]] : '' };
+    if (!K.loc || !ok(get(p, K.loc))) K.loc = findKey(p, ok); const d = K.loc && p[K.loc]; if (!d) return { zoom: 0, scope: '', weaps: [] }; const k = Object.keys(d);
+    return { zoom: d[k[1]] > 0 && d[k[1]] < 500 ? d[k[1]] : 0, scope: /^\d+xscope$/.test(d[k[3]]) ? d[k[3]] : '', hp: d[k[0]], boost: d[k[2]], cur: d[k[4]], inv: d[k[5]], weaps: d[k[6]] };
   }
+  // loot, grenades in flight, airdrops, planes and the zone: their classes keep plain field names (client loot.ts, projectile.ts, airdrop.ts,
+  // plane.ts, gas.ts); only the game's key for each is renamed, so each is found by what it holds
+  const holder = (g, kk, test) => { if (!K[kk] || !test(get(g, K[kk]) || 0)) K[kk] = findKey(g, test); return K[kk] ? g[K[kk]] : null; };
+  const lootPool = g => { const b = holder(g, 'loot', v => !!v.lootPool); return b ? pool(b.lootPool) : []; };
+  const projPool = g => { const b = holder(g, 'proj', v => !!v.projectilePool); return b ? pool(b.projectilePool) : []; };
+  const airPool = g => { const b = holder(g, 'air', v => !!v.airdropPool); return b ? pool(b.airdropPool) : []; };
+  const planeList = g => { const b = holder(g, 'plane', v => Array.isArray(v.planes)); return b ? b.planes : []; };
+  const gasOf = g => holder(g, 'gas', v => typeof v.mode === 'number' && v.circleOld && v.circleNew && typeof v.duration === 'number');
   const obstacles = g => { const m = theMap(g); if (!m) return []; if (!K.obst) K.obst = findKey(m, v => pool(v).some(o => o && typeof o.type === 'string' && isVec(o.pos))); return K.obst ? pool(m[K.obst]) : []; };
   const bullets = g => { if (!K.bul || !Array.isArray((get(g, K.bul) || {}).bullets)) K.bul = findKey(g, v => Array.isArray(v.bullets)); return K.bul ? g[K.bul].bullets : []; };
   // smoke: the barn with a numeric zIdx, an array and a pool (the renderer has zIdx and arrays too, but no pool)
@@ -227,6 +236,7 @@
   const dir8 = d => (isVec(d) ? Math.round((Math.atan2(d.y, d.x) + Math.PI) / (2 * Math.PI) * 255) : 0);
   const sess = Math.random().toString(36).slice(2, 12);
   let nU = 0, buf = [], match = 0, inMatch = false, startT = 0, myId = 0, watching = 0, lastUpdate = 0, wasDead = false, game = null;
+  const lootSeen = new Map(), projSeen = new Map(), airSeen = new Set(), planeSeen = new Map(), perkSeen = new Map(); let gasSig = '', invSig = '';
   const strings = new Map(), obsSeen = new Map(), bulSeen = new WeakMap(), smokeSeen = new Map(); let infoSig = '';
   // rp: the current match's notes for the death replay. Everything that describes the match (map, names of things, obstacles, kills,
   // smoke) is kept; moment-to-moment notes (updates, bullets, explosions, emotes, pings) only for the last minute
@@ -239,7 +249,7 @@
 
   function matchStart(g, me) {
     inMatch = true; match++; startT = now(); myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = ''; rp = []; rpPruned = 0; rpSnap = null; wireSnap = null; diedAt = 0; died = false; for (const k in names) delete names[k]; replayBtn();
-    strings.clear(); obsSeen.clear(); smokeSeen.clear(); for (const k of ['barn', 'me', 'map', 'obst', 'bul', 'smoke', 'net', 'loc']) K[k] = null;
+    strings.clear(); obsSeen.clear(); smokeSeen.clear(); for (const k of ['barn', 'me', 'map', 'obst', 'bul', 'smoke', 'net', 'loc', 'loot', 'proj', 'air', 'plane', 'gas']) K[k] = null; lootSeen.clear(); projSeen.clear(); airSeen.clear(); planeSeen.clear(); perkSeen.clear(); gasSig = ''; invSig = '';
     const m = theMap(g);
     push(['M', now(), { map: m && m.mapName || null, seed: m && m.seed || 0, w: m && m.width || 0, h: m && m.height || 0, host: location.hostname, myId, cfg: { who: 'contrib', v: VERSION } }]);
     const md = m && m.mapData;
@@ -299,8 +309,8 @@
     // you (or the player you watch after you die), then everyone else in view
     const n = net(me), pos = isVec(n.pos) ? n.pos : me[K.pos] || { x: 0, y: 0 }, flags = (n.dead ? 1 : 0) | (n.downed ? 2 : 0) | (n.pan ? 8 : 0) | (n.heal ? 16 : 0) | (n.boost ? 32 : 0);
     if (me.__id === myId && n.dead && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; diedAt = t; replayBtn(); }
-    const ld = local(me);
-    const meRec = [r2(pos.x), r2(pos.y), dir8(isVec(n.dir) ? n.dir : K.dir && me[K.dir]), me.layer | 0, 0, 0, 0, str(n.weap), 0, 0, 0, 0, 0, 0, str(n.helmet), str(n.chest), str(n.pack), str(ld.scope), r2(ld.zoom), n.anim | 0, n.action | 0, str(n.actItem), flags, 0, 0, r2(typeof n.scale === 'number' ? n.scale : 1), str(n.outfit)]; // 25 size, 26 outfit (a Tank is bigger and wears its own skin)
+    const ld = local(me), W = Array.isArray(ld.weaps) ? ld.weaps : [], ws = i => str(W[i] && W[i].type), wa = i => (W[i] && W[i].ammo) | 0, haveW = W.length >= 4 && typeof ld.cur === 'number';
+    const meRec = [r2(pos.x), r2(pos.y), dir8(isVec(n.dir) ? n.dir : K.dir && me[K.dir]), me.layer | 0, r2(ld.hp), r2(ld.boost), haveW ? ld.cur | 0 : 0, haveW ? ws(0) : str(n.weap), wa(0), ws(1), wa(1), ws(2), ws(3), wa(3), str(n.helmet), str(n.chest), str(n.pack), str(ld.scope), r2(ld.zoom), n.anim | 0, n.action | 0, str(n.actItem), flags, 0, 0, r2(typeof n.scale === 'number' ? n.scale : 1), str(n.outfit)]; // 25 size, 26 outfit (a Tank is bigger and wears its own skin)
     const info = b.playerInfo || {}, mine = info[myId] || {}, players = [];
     for (const p of pool(b.playerPool)) {
       if (!p || !p.active || p.__id === me.__id) continue; const q = net(p), pp = isVec(q.pos) ? q.pos : p[K.pos]; if (!isVec(pp)) continue; const pi = info[p.__id] || {};
@@ -308,7 +318,27 @@
       players.push([p.__id, r2(pp.x), r2(pp.y), dir8(isVec(q.dir) ? q.dir : K.dir && p[K.dir]), p.layer | 0, str(q.weap), str(q.helmet), str(q.chest), str(q.pack),
         (q.dead ? 1 : 0) | (q.downed ? 2 : 0) | (mate ? 4 : 0) | (q.pan ? 8 : 0) | (q.heal ? 16 : 0) | (q.boost ? 32 : 0), q.anim | 0, q.action | 0, str(q.actItem), r2(typeof q.scale === 'number' ? q.scale : 1), str(q.outfit)]);
     }
-    push(['u', t, Math.round(lu), 0, 0, Math.round(gap), meRec, players, null]); nU++;
+    const gas = gasOf(g); push(['u', t, Math.round(lu), 0, 0, Math.round(gap), meRec, players, gas ? r2(gas.circleT) : null]); nU++;
+    // the zone (on change), the shown player's inventory (on change), everyone's role and perks (on change)
+    if (gas && gas.circleOld.pos && gas.circleNew.pos) { const sig = [gas.mode, gas.duration, gas.circleOld.pos.x, gas.circleOld.pos.y, gas.circleOld.rad, gas.circleNew.pos.x, gas.circleNew.pos.y, gas.circleNew.rad].join(',');
+      if (sig !== gasSig) { gasSig = sig; push(['g', t, gas.mode | 0, r2(gas.duration), r2(gas.circleT), r2(gas.circleOld.pos.x), r2(gas.circleOld.pos.y), r2(gas.circleOld.rad), r2(gas.circleNew.pos.x), r2(gas.circleNew.pos.y), r2(gas.circleNew.rad)]); } }
+    if (ld.inv && typeof ld.inv === 'object') { const sig = JSON.stringify(ld.inv); if (sig !== invSig) { invSig = sig; push(['v', t, JSON.parse(sig)]); } }
+    for (const p of pool(b.playerPool)) { if (!p || !p.active) continue; const q = net(p); if (!Array.isArray(q.perks)) continue; const sig = (q.role || '') + '|' + q.perks.map(x => x && x.type).join(',');
+      if (perkSeen.get(p.__id) !== sig) { perkSeen.set(p.__id, sig); push(['P', t, p.__id, str(q.role), q.perks.map(x => str(x && x.type))]); } }
+    // loot: seen, moved (half a stud) or changed, gone; grenades in flight: first seen and where last seen; airdrops: first seen with how far
+    // they had fallen; planes: first seen and when they drop
+    const lootNow = new Set();
+    for (const o of lootPool(g)) { if (!o || !o.active || !isVec(o.pos) || typeof o.type !== 'string') continue; lootNow.add(o.__id); const key = o.type + '|' + (o.count | 0), was = lootSeen.get(o.__id);
+      if (!was || was.k !== key || Math.hypot(o.pos.x - was.x, o.pos.y - was.y) > 0.5) { lootSeen.set(o.__id, { k: key, x: o.pos.x, y: o.pos.y }); push(['L', t, o.__id, str(o.type), o.count | 0, r2(o.pos.x), r2(o.pos.y), o.layer | 0]); } }
+    for (const id of [...lootSeen.keys()]) if (!lootNow.has(id)) { lootSeen.delete(id); push(['l', t, id]); }
+    const projNow = new Set();
+    for (const o of projPool(g)) { if (!o || !o.active || !isVec(o.pos)) continue; projNow.add(o.__id); if (!projSeen.has(o.__id)) push(['p', t, o.__id, str(o.type), r2(o.pos.x), r2(o.pos.y), o.layer | 0]); projSeen.set(o.__id, [r2(o.pos.x), r2(o.pos.y)]); }
+    for (const [id, p] of [...projSeen]) if (!projNow.has(id)) { projSeen.delete(id); push(['q', t, id, p[0], p[1]]); }
+    const airNow = new Set();
+    for (const o of airPool(g)) { if (!o || !o.active || !isVec(o.pos)) continue; airNow.add(o.__id); if (!airSeen.has(o.__id)) { airSeen.add(o.__id); push(['a', t, o.__id, r2(o.pos.x), r2(o.pos.y), r2(Math.min(1, (+o.fallTicker || 0) / 8)), o.landed ? 1 : 0]); } }
+    for (const id of [...airSeen]) if (!airNow.has(id)) airSeen.delete(id);
+    for (const pl of planeList(g)) { if (!pl || !pl.active || !isVec(pl.pos) || !isVec(pl.planeDir)) continue; const key = pl.id + '|' + (pl.actionComplete ? 1 : 0);
+      if (planeSeen.get(pl.id) !== key) { planeSeen.set(pl.id, key); push(['Z', t, pl.id | 0, r2(pl.pos.x), r2(pl.pos.y), r4(pl.planeDir.x), r4(pl.planeDir.y), pl.type | 0, pl.actionComplete ? 1 : 0]); } }
     for (const k of Object.keys(info)) { const nm = (info[k] || {}).name; if (typeof nm === 'string' && nm) names[k] = nm.slice(0, 24); } // for the replay tab only, never uploaded
     prune(t); if (died && !rpSnap && t - diedAt >= 2000) { rpSnap = rp.slice(); wireSnap = wireCut(); }
     const ids = Object.keys(info), sig = ids.join(','); if (sig !== infoSig) { infoSig = sig; push(['I', t, ids.map(k => [+k, (info[k] || {}).teamId | 0, (info[k] || {}).groupId | 0])]); }
@@ -319,7 +349,7 @@
       const first = !obsSeen.has(o.__id), c = o.collider;
       const col = !(first || o.isDoor) || !c ? null : c.type === 0 && c.pos ? [0, r2(c.pos.x), r2(c.pos.y), r2(c.rad)] : c.type === 1 && c.min && c.max ? [1, r2(c.min.x), r2(c.min.y), r2(c.max.x), r2(c.max.y)] : null;
       const s2 = fl * 32 + hp + (o.isDoor ? '|' + col : '');
-      if (obsSeen.get(o.__id) !== s2) { obsSeen.set(o.__id, s2); const rec = ['o', t, o.__id, str(o.type), r2(o.pos.x), r2(o.pos.y), o.layer | 0, fl, hp]; if (col) rec.push(col); push(rec); }
+      if (obsSeen.get(o.__id) !== s2) { obsSeen.set(o.__id, s2); const rec = ['o', t, o.__id, str(o.type), r2(o.pos.x), r2(o.pos.y), o.layer | 0, fl, hp]; if (col || first) rec.push(col); if (first) rec.push(typeof o.rot === 'number' ? ((Math.round(o.rot / (Math.PI / 2)) % 4) + 4) % 4 : 0); push(rec); } // 10: its quarter turn, once (1.4.2)
     }
     // bullets, once each
     for (const q of bullets(g)) {
@@ -496,6 +526,7 @@
     const w = window.open(location.origin + '/?u=' + encodeURIComponent(btoa(KC_URL)) + '&jt=vb', '_blank'); if (!w) return;
     kcSnap.set(w, s); while (kcSnap.size > 3) kcSnap.delete(kcSnap.keys().next().value);
   }
+  window.__observerNotes = () => buf.map(r => r[1]); // tools/test-observer-wire.js: what was noted (nothing leaves the page in that test)
   window.__observerWire = () => (wire ? { n: wire.frames.length, bytes: wire.bytes, url: wire.url, u: nU, upd: updSeq } : null); // the same test: how much of the socket is copied
   window.__observerKillcam = () => { const s = wireCut(); if (s) { s.death = Math.round(performance.now()); wireSnap = s; died = true; } openKillcam(); }; // tools/test-observer-killcam.js: the killcam without dying
 
