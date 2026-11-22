@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.3.4
+// @version      1.3.5
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
@@ -18,14 +18,18 @@
 //  4. It also keeps the last minute of notes in memory (and, once you die, the minute before your death). When you die, a "Death replay" button opens the clip jury's replay page and
 //     hands it those notes directly (nothing is uploaded for this). For the replay only, it reads the players' names from the game:
 //     they go to that page in your browser and nowhere else; they are never in what is uploaded.
-// It sends nothing about you beyond what is in the game (no name, no account, no browser data). The badge in the bottom left
+//  5. Only if you are signed in to a survev.io account: once a match is over it asks survev.io for your own match history (the list on
+//     your stats page) and finds that match's game id, and sends that id. A report to the game's moderators needs it. Your account's
+//     name is used for that one question to survev.io and is never sent to us; but the game id points at the game's public stats page,
+//     where every player's name is, yours too. Not signed in: this step never runs.
+// It sends nothing else about you beyond what is in the game (no name, no account, no browser data). The badge in the bottom left
 // corner shows that it is on and how much it sent; click it to pause or resume. See README.md for the full list.
 
 (function () {
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
   const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
-  const VERSION = 'observer-1.3.4', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7; // BATCH: lines in one upload at most (the server takes 600 KB)
+  const VERSION = 'observer-1.3.5', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7; // BATCH: lines in one upload at most (the server takes 600 KB)
 
   // ---------- 1. find the game ----------
   // The game's main object is passed through Function.prototype.call once while it boots. We look at each call until we see
@@ -88,11 +92,11 @@
   // One JSON array per line, the same format the clip jury reads: M match start, m the map, u one world update (you and every
   // player in view), b a bullet, o an obstacle, K a kill, F/f smoke, X an explosion, e an emote, n a map ping, I team ids, S who you
   // watch after you die, D your death,
-  // E match end, s names (weapons, gear, obstacle types) as numbers.
+  // E match end, s names (weapons, gear, obstacle types) as numbers, G the game's id (part 4, signed-in players only).
   const r2 = v => (typeof v === 'number' ? Math.round(v * 100) / 100 : 0), r4 = v => (typeof v === 'number' ? Math.round(v * 1e4) / 1e4 : 0);
   const dir8 = d => (isVec(d) ? Math.round((Math.atan2(d.y, d.x) + Math.PI) / (2 * Math.PI) * 255) : 0);
   const sess = Math.random().toString(36).slice(2, 12);
-  let buf = [], match = 0, inMatch = false, myId = 0, watching = 0, lastUpdate = 0, wasDead = false, game = null;
+  let buf = [], match = 0, inMatch = false, startT = 0, myId = 0, watching = 0, lastUpdate = 0, wasDead = false, game = null;
   const strings = new Map(), obsSeen = new Map(), bulSeen = new WeakMap(), smokeSeen = new Map(); let infoSig = '';
   // rp: the current match's notes for the death replay. Everything that describes the match (map, names of things, obstacles, kills,
   // smoke) is kept; moment-to-moment notes (updates, bullets, explosions, emotes, pings) only for the last minute
@@ -104,7 +108,7 @@
   function str(s) { if (typeof s !== 'string' || !s) return 0; let i = strings.get(s); if (i === undefined) { i = strings.size + 1; strings.set(s, i); push(['s', i, s]); } return i; }
 
   function matchStart(g, me) {
-    inMatch = true; match++; myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = ''; rp = []; rpPruned = 0; rpSnap = null; diedAt = 0; died = false; for (const k in names) delete names[k]; replayBtn();
+    inMatch = true; match++; startT = now(); myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = ''; rp = []; rpPruned = 0; rpSnap = null; diedAt = 0; died = false; for (const k in names) delete names[k]; replayBtn();
     strings.clear(); obsSeen.clear(); smokeSeen.clear(); for (const k of ['barn', 'me', 'map', 'obst', 'bul', 'smoke', 'net', 'loc']) K[k] = null;
     const m = theMap(g);
     push(['M', now(), { map: m && m.mapName || null, seed: m && m.seed || 0, w: m && m.width || 0, h: m && m.height || 0, host: location.hostname, myId, cfg: { who: 'contrib', v: VERSION } }]);
@@ -115,7 +119,7 @@
     if (md && Array.isArray(md.objects)) push(['m', now(), md.objects.map(o => [str(o.type), r2(o.pos && o.pos.x), r2(o.pos && o.pos.y), o.ori | 0, r2(o.scale)]), (md.places || []).map(p => [str(p.name), r2(p.pos && p.pos.x), r2(p.pos && p.pos.y)]), terrain]);
     hookKills(g);
   }
-  function matchEnd(why) { if (!inMatch) return; inMatch = false; push(['E', now(), why, 0, 0, null]); flush(); }
+  function matchEnd(why) { if (!inMatch) return; inMatch = false; const t = now(); push(['E', t, why, 0, 0, null]); gameNote(t); flush(); }
 
   // the kill feed: the server sends every kill to every client; the game reads it and only draws it. We read the same fields
   // first and put the reading position back, so the game reads them exactly as before.
@@ -208,6 +212,7 @@
     if (typeof CompressionStream !== 'function') return { body: new TextEncoder().encode(text), enc: 'plain' };
     const s = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip')); return { body: new Uint8Array(await new Response(s).arrayBuffer()), enc: 'gzip' };
   }
+  const send = z => fetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Observer-Token': token, 'X-Observer-Encoding': z.enc, 'X-Observer-Version': VERSION }, body: z.body });
   async function flush() {
     if (sending || !buf.length || paused) return; sending = true;
     // one batch: notes of one match only (its number goes in the header; a late tail of the last match sent under the next match's
@@ -217,11 +222,81 @@
     const text = JSON.stringify(['B', sess, VERSION, m0, Math.round(Date.now() - performance.now())]) + '\n' + part.map(r => JSON.stringify(r[1])).join('\n') + '\n';
     try {
       const z = await zip(text);
-      const res = await fetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Observer-Token': token, 'X-Observer-Encoding': z.enc, 'X-Observer-Version': VERSION }, body: z.body });
+      const res = await send(z);
       if (res.ok) { sentBytes += z.body.length; lastError = ''; } else { lastError = 'server said ' + res.status; if (res.status >= 500 || res.status === 429) buf = part.concat(buf).slice(-KEEP); }
     } catch (e) { lastError = 'offline'; buf = part.concat(buf).slice(-KEEP); }
     sending = false; badge();
     if (!lastError && buf.length && (buf.length >= BATCH || buf[0][0] !== match || !inMatch)) setTimeout(flush, 5500); // a backlog: the next part soon (the server takes 12 a minute)
+  }
+
+  // ---------- 4. the game's id (signed-in players only) ----------
+  // A moderator of the game can only act on a report that names the game, and the game never tells its client that id. The game's
+  // own stats API does: your match history (what your stats page shows) lists your games with their ids, once a game is over.
+  // So, only when the game says you are signed in: when a match ends a small note is kept in this browser (which match it was, when it
+  // started, how long you lived, your in-game number; no names), and from the menu survev.io is asked for your match history (one
+  // request, at most six tries a match, spaced from 30 seconds to 40 minutes: a game can go on long after you die). The row whose
+  // time alive is yours names the game, and one line is sent: G, the match's start, the game id, your in-game number.
+  // The history is on the game's API host, where the game's own stats page asks for it: survev.io/api/match_history itself answers
+  // 404 (checked 2026-11-22), and the API host allows the request from a survev.io page (its CORS answer names https://survev.io).
+  // Your account's name goes to survev.io only, as on your own stats page; it is not kept and never sent to us.
+  const GAMES = 'observer.games', HISTORY = 'https://api.survev.io/api/match_history', GAME_WAIT = [30e3, 120e3, 300e3, 600e3, 1200e3, 2400e3], GAME_MAX = 12;
+  let games = []; try { games = JSON.parse(localStorage.getItem(GAMES) || '[]'); if (!Array.isArray(games)) games = []; } catch (e) { games = []; }
+  let gameBusy = false;
+  const gameSave = () => { try { localStorage.setItem(GAMES, JSON.stringify(games)); } catch (e) {} };
+  const slug = () => { try { const a = app && app.account, s = a && a.loggedIn && a.profile && a.profile.slug; return typeof s === 'string' ? s : ''; } catch (e) { return ''; } };
+  // a match just ended: s session, m match number, o this page's clock against the wall clock, t its start, a how long you lived (to
+  // your death, or to the end), e how long it was recorded, id your in-game number, w when it ended, n tries so far, v 1 when you
+  // were never seen dead (a win, or you left alive); later g the game id once found, u failed uploads of it, x no upload before then
+  function gameNote(t) {
+    if (!slug() || !myId) return; const a = (diedAt || t) - startT; if (!(a > 0)) return;
+    games.push({ s: sess, m: match, o: Math.round(Date.now() - performance.now()), t: startT, a, e: t - startT, id: myId, w: Date.now(), n: 0, v: diedAt ? 0 : 1 });
+    if (games.length > GAME_MAX) games.splice(0, games.length - GAME_MAX); gameSave();
+  }
+  // Which row of the history is that match. The server counts a player's time alive from their own join to their death, so it equals
+  // the note's a whatever the two clocks say (within 2 s); the row's end_time, when the game ended, cannot be before the last moment
+  // recorded (2 minutes allowed for a clock that is off). Two games fit: the one that ended as the recording did, else the closer
+  // time alive by a full second, else none. Rows that do not reach back to the match's start (10 a page) may miss its game: then only a
+  // game that ended as the recording did.
+  // Alive at the end (v): the recording runs on over the results screen, while the server stops counting at game over (player.ts:1469
+  // is not reached once the game is over; rounded in gameProcess.ts:178), so the time alive is only a ceiling. Then a row fits when
+  // its rank is 1 (alive at game over is the winning side), its time alive is not above ours, and its game ended when that time alive
+  // says it did, counted from our start (2 minutes for the clocks).
+  function gamePick(p, rows) {
+    if (!Array.isArray(rows)) return null; const start = p.o + p.t, c = new Map();
+    for (const r of rows) {
+      if (!r || typeof r.guid !== 'string' || !/^[\w-]{8,64}$/.test(r.guid) || typeof r.time_alive !== 'number') continue; const end = Date.parse(r.end_time); let d = Math.abs(r.time_alive - p.a / 1000);
+      if (!(end > start + p.e - 120e3 && end < start + 2400e3) || !(d <= 2)) { if (!p.v || r.rank !== 1 || !(r.time_alive <= p.a / 1000 + 2)) continue; d = Math.abs(end - start - r.time_alive * 1000) / 1000; if (!(d <= 120)) continue; }
+      const e = Math.abs(end - (start + p.e)), q = c.get(r.guid); if (!q || d < q.d) c.set(r.guid, { g: r.guid, d, e: q ? Math.min(q.e, e) : e }); else if (e < q.e) q.e = e;
+    }
+    const a = [...c.values()].sort((x, y) => x.d - y.d), near = a.filter(x => x.e <= 30e3); if (!a.length) return null;
+    if (near.length === 1) return near[0].g;
+    const whole = rows.length < 10 || rows.some(r => r && Date.parse(r.end_time) < start);
+    return whole && (a.length === 1 || a[1].d - a[0].d >= 1) ? a[0].g : null;
+  }
+  const gameDue = (p, wall) => !p.g && wall - p.w >= GAME_WAIT[Math.min(p.n, GAME_WAIT.length - 1)];
+  // from the menu: one history request for every note that is due, then one small batch per game found (header of the match it
+  // belongs to, so the line lands on that match). A note is dropped once sent, after six tries, or after a day. An upload that fails
+  // waits like the history does (30 seconds to 40 minutes, six times at most) and ends the round: the match batches share the
+  // server's 12 a minute, and a G line must never take a recording's place there.
+  async function gameIds() {
+    if (gameBusy || paused || inMatch || !games.length) return; const wall = Date.now(), n0 = games.length;
+    games = games.filter(p => p && (p.g ? !(p.u >= GAME_WAIT.length) : p.n < GAME_WAIT.length) && wall - p.w < 86400e3); if (games.length !== n0) gameSave();
+    const me = slug(), due = games.filter(p => gameDue(p, wall)), up = p => p.g && !(wall < p.x); if (!games.some(up) && (!me || !due.length)) return;
+    gameBusy = true;
+    try {
+      if (me && due.length) {
+        for (const p of due) p.n++; gameSave(); // counted before the request: a failing one is not asked again at once
+        const res = await fetch(HISTORY, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ slug: me, offset: 0, count: 10, teamModeFilter: 7 }) });
+        const rows = res.ok ? await res.json() : null;
+        for (const p of due) { const g = gamePick(p, rows); if (g) p.g = g; } gameSave();
+      }
+      for (const p of games.filter(up)) {
+        const z = await zip(JSON.stringify(['B', p.s, VERSION, p.m, p.o]) + '\n' + JSON.stringify(['G', p.t, p.g, p.id]) + '\n'); let res = null; try { res = await send(z); } catch (e) {}
+        if (res && (res.ok || (res.status < 500 && res.status !== 429))) { games.splice(games.indexOf(p), 1); gameSave(); if (res.ok) sentBytes += z.body.length; continue; }
+        p.u = (p.u | 0) + 1; p.x = wall + GAME_WAIT[Math.min(p.u, GAME_WAIT.length) - 1]; gameSave(); break;
+      }
+    } catch (e) {}
+    gameBusy = false;
   }
 
   // ---------- the badge ----------
@@ -276,7 +351,7 @@
 
   function loop() { try { tick(); } catch (e) {} requestAnimationFrame(loop); }
   requestAnimationFrame(loop);
-  setInterval(() => { flush(); badge(); }, FLUSH_MS);
+  setInterval(() => { flush(); badge(); gameIds(); }, FLUSH_MS);
   setInterval(badge, 2000);
   setInterval(() => { try { replayBtn(); } catch (e) {} }, 400); // the game rebuilds its results panel each time it shows it
 })();
