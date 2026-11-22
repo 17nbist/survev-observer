@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.4.2
+// @version      1.4.3
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters, and replays your death through the game itself. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
@@ -31,7 +31,7 @@
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
   const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
-  const VERSION = 'observer-1.4.2', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
+  const VERSION = 'observer-1.4.3', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
 
   // ---------- 0. a copy of the game's socket, and the killcam ----------
   // The approach of "Surviv.io input replay recorder" (greasyfork.org/scripts/447501, MIT, by garlic, samer kizi and preacher):
@@ -134,10 +134,16 @@
         u.play = btn('Pause', () => { if (!KC.ready || KC.done) return; if (!KC.went) { go(false); return; } KC.playing = !KC.playing; KC.base = performance.now(); bar(); });
         u.sp = [0.25, 0.5, 1, 2].map(x => btn(x + 'x', () => { KC.user = x; if (KC.speed !== 4) KC.speed = x; KC.base = performance.now(); bar(); }));
         btn('Restart', () => location.reload());
+        u.note = document.createElement('span'); u.note.style.cssText = 'color:#9be08a;font-weight:600'; u.box.appendChild(u.note);
         u.time = document.createElement('span'); u.time.style.cssText = 'min-width:84px;text-align:right;font-variant-numeric:tabular-nums'; u.box.appendChild(u.time);
         u.start = document.createElement('div'); u.start.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;display:none;flex-direction:column;gap:12px;align-items:center;background:rgba(0,0,0,.78);color:#fff;font:600 14px system-ui,sans-serif;padding:22px 28px;border-radius:10px;text-align:center';
         btn('\u25B6 Play', () => go(false), u.start, true); btn('\u25CF Save video', () => go(true), u.start, true);
-        u.msg = document.createElement('div'); u.msg.style.cssText = 'max-width:320px;color:#ccc'; u.msg.textContent = 'Save video asks to record this tab, plays the replay with sound and downloads it as a video file.'; u.start.appendChild(u.msg);
+        // video size (1.4.3): Discord takes 10 MB from a free account, so that is the default; Best quality is 60 fps at 8 Mbps (about 40 MB)
+        u.q = document.createElement('select'); u.q.style.cssText = 'font:600 14px system-ui,sans-serif;padding:4px 6px;border-radius:4px';
+        [['discord', 'Video size: for Discord (under 10 MB)'], ['best', 'Video size: best quality (about 40 MB)']].forEach(([v, l]) => { const o = document.createElement('option'); o.value = v; o.textContent = l; u.q.appendChild(o); });
+        try { u.q.value = localStorage.getItem('observer.videoq') === 'best' ? 'best' : 'discord'; } catch (e) {}
+        u.q.onchange = () => { try { localStorage.setItem('observer.videoq', u.q.value); } catch (e) {} }; u.start.appendChild(u.q);
+        u.msg = document.createElement('div'); u.msg.style.cssText = 'max-width:320px;color:#ccc'; u.msg.textContent = 'Save video asks to record this tab, plays the replay with sound and downloads it as a video file. Pick the speed on the bar first: slower makes a longer video.'; u.start.appendChild(u.msg);
         document.body.appendChild(u.cover); document.body.appendChild(u.box); document.body.appendChild(u.start); }
       const u = KC.ui, catching = !KC.started || KC.bursting || KC.speed === 4;
       u.cover.style.display = catching ? 'flex' : 'none';
@@ -153,13 +159,20 @@
     async function go(rec) {
       if (!KC.ready || KC.went) return;
       if (rec) {
-        let s; try { s = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 60, cursor: 'never' }, audio: true, preferCurrentTab: true, selfBrowserSurface: 'include', systemAudio: 'include' }); }
+        // Chrome's encoder meets the asked bitrate at 30 fps and makes about twice it at 60 (measured 1.4.3: 8 Mbps asked, 15.8 made at
+        // 60 fps; 3 asked, 3.0 made at 30). For Discord: 30 fps and the bitrate that fits 9 MB in the recording's length at this speed
+        // (the 20 s and 2 s after, 0.4 s lead in, 1 s tail), less the sound.
+        const best = KC.ui.q && KC.ui.q.value === 'best', secs = (KC.to - KC.from) / 1000 / KC.user + 1.4 + 1;
+        const vbps = best ? 8e6 : Math.round(Math.max(3e5, Math.min(6e6, 9e6 * 8 * 0.95 / secs - 128e3)));
+        let s; try { s = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: best ? 60 : 30, cursor: 'never' }, audio: true, preferCurrentTab: true, selfBrowserSurface: 'include', systemAudio: 'include' }); }
         catch (e) { KC.ui.msg.textContent = 'No video: ' + (e && e.name === 'NotAllowedError' ? 'recording was not allowed.' : 'this browser cannot record a tab.') + ' Play still works.'; return; }
         const type = ['video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm'].find(x => window.MediaRecorder && MediaRecorder.isTypeSupported(x));
-        let mr; try { mr = new MediaRecorder(s, type ? { mimeType: type, videoBitsPerSecond: 8e6 } : undefined); } catch (e) { s.getTracks().forEach(x => x.stop()); KC.ui.msg.textContent = 'No video: this browser cannot record. Play still works.'; return; }
+        let mr; try { mr = new MediaRecorder(s, type ? { mimeType: type, videoBitsPerSecond: vbps, audioBitsPerSecond: 128e3 } : undefined); } catch (e) { s.getTracks().forEach(x => x.stop()); KC.ui.msg.textContent = 'No video: this browser cannot record. Play still works.'; return; }
         const parts = []; KC.rec = { mr, s, type: mr.mimeType || type || 'video/webm' }; mr.ondataavailable = e => { if (e.data && e.data.size) parts.push(e.data); };
         mr.onstop = () => { const ty = KC.rec ? KC.rec.type : 'video/webm', a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(parts, { type: ty }));
           a.download = 'survev-death-replay-' + new Date(D0()).toISOString().slice(0, 19).replace(/[T:]/g, '-') + (/mp4/.test(ty) ? '.mp4' : '.webm'); document.body.appendChild(a); a.click(); a.remove();
+          const mb = parts.reduce((n, p) => n + p.size, 0) / 1e6; KC.saved = mb; // on the bar: the start panel is gone by now
+          KC.ui.note.textContent = 'Saved ' + mb.toFixed(1) + ' MB' + (mb > 10 ? ': too big for a free Discord account. Restart, pick "for Discord", save again' : '');
           s.getTracks().forEach(x => x.stop()); KC.rec = null; bar(); };
         s.getVideoTracks().forEach(x => { x.onended = stopRec; }); mr.start(1000);
         KC.went = true; bar(); await new Promise(r => setTimeout(r, 400)); // the recording has its first frames before the replay moves
