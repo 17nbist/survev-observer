@@ -18,9 +18,17 @@ Step by step with pictures: [guide/GUIDE.md](guide/GUIDE.md).
 
 When you die, a "Death replay" button appears (under Play Again, at the top of the spectate menu, or above the label). It opens
 survev.io in a new tab and plays your last 20 seconds back through the game's own client: your screen exactly as you saw it, your
-HUD, the doors, the kill feed, drawn by the game itself. The bar at the top pauses it, changes the speed (0.25x to 2x) and starts it
-again. Save video records it with its sound and downloads a video file: by default sized for Discord (under 10 MB, 30 frames a
-second, from 1.4.3), or best quality (60 frames a second, about 40 MB) if you pick it before saving.
+HUD, the doors, the kill feed, drawn by the game itself.
+
+The bar at the top (from 1.5.0):
+
+- pause and play, 5 s back or on, back to the start, and a slider to go anywhere in the 20 s; going back
+  takes about a second and never reloads the tab
+- **Death**: straight to the 4 s before your death; **Loop** plays those 4 s and the 2 after again and again
+- speed 0.25x to 2x; slow motion is smooth (before 1.5.0 players crawled and jumped in slow motion and stuttered at 2x)
+- **Video**: one click, no prompt. It records from where the replay is to the end, with the game's sound, and downloads the file:
+  by default sized for Discord (under 10 MB, 30 frames a second), or best quality (60 frames a second) if you pick it on the start
+  panel. The video is the game's own picture with its HUD (health, boost, ammo, players alive, kill leader, kill feed) drawn on it.
 
 How: the script keeps a copy of what the server sends your game (about 3 KB a second, in that tab only, never uploaded). The replay
 tab's game plays that copy instead of joining a server, so it sends nothing anywhere. Player names are in the copy, since the
