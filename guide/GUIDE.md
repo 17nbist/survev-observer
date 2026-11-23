@@ -40,6 +40,8 @@ Open [survev.io](https://survev.io/) (reload it if it was already open). In the 
 
 That's it. Play as normal. The number goes up as it sends your matches. Click the label to pause it.
 
+To get new versions sooner, click the Tampermonkey icon, then **Dashboard > Settings**, and set **Check for userscript updates** to every hour (it is once a day by default).
+
 ## 5. Pick a clip key (optional)
 
 The first time, the menu shows an orange bar. Click **Set key** and press the key (or mouse side button) you want. In a match,
