@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.6.0
+// @version      1.7.0
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters, replays your death through the game itself, and saves a clip of the last 20 seconds on a key you pick. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
 // @grant        none
+// @require      https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.min.js
 // @downloadURL  https://raw.githubusercontent.com/17nbist/survev-observer/main/survev-observer.user.js
 // @updateURL    https://raw.githubusercontent.com/17nbist/survev-observer/main/survev-observer.user.js
 // ==/UserScript==
@@ -35,7 +36,7 @@
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
   const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
-  const VERSION = 'observer-1.6.0', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
+  const VERSION = 'observer-1.7.0', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
 
   // ---------- 0. a copy of the game's socket, and the killcam ----------
   // The approach of "Surviv.io input replay recorder" (greasyfork.org/scripts/447501, MIT, by garlic, samer kizi and preacher):
@@ -87,10 +88,10 @@
   // the doors, the kill feed. Nothing goes to any server from this tab: what the client sends is dropped, the stand-in address
   // (.invalid) can never connect anywhere, a real game cannot be joined here, and no notes are kept or sent.
   // 1.5.0: one clock for the replay (slow motion and 2x move smoothly), going back without reloading the tab (the game is rebuilt in
-  // place and given the copy again up to the new point), a bar to scrub, a jump to the death, a loop, and Save video in one click (it
-  // records the game's own picture and sound, so the browser asks nothing).
+  // place and given the copy again up to the new point), a bar to scrub, a jump to the death and a loop. 1.7.0: it plays as it opens, and
+  // Download makes the whole replay frame by frame on this clock, faster than it plays (download() below), with the game's own sound.
   function killcam() {
-    const KC = { sock: null, data: null, started: false, bursting: false, pre: false, ready: false, rec: null, playing: true, speed: 1, user: 1, vt: 0, i: 0, first: 0, from: 0, to: 0, done: false, ui: null, went: false, gen: 0, loop: false, want: null, seeks: 0, cv: null };
+    const KC = { sock: null, data: null, started: false, bursting: false, pre: false, ready: false, rec: null, playing: true, speed: 1, user: 1, vt: 0, i: 0, first: 0, from: 0, to: 0, done: false, ui: null, went: false, gen: 0, loop: false, want: null, seeks: 0, cv: null, dl: null, dlInfo: null };
     // the game's settings are read here, never written; your facing comes from the recording, not this tab's mouse (local rotation off)
     try { const SPr = Storage.prototype, gi = SPr.getItem, si = SPr.setItem;
       SPr.getItem = function (k) { const v = gi.call(this, k); if (k !== 'surviv_config' || this !== window.localStorage) return v; try { const c = JSON.parse(v || '{}'); c.localRotation = false; return JSON.stringify(c); } catch (e) { return v; } };
@@ -100,16 +101,56 @@
     // measures it (game.ts m_processGameUpdate sets the camera's interpolation interval), so with only the frame clock slowed, slow
     // motion moved players a quarter of each step and then jumped them (0.25x), and 2x stopped them halfway (before 1.5.0).
     // Whoever changes the speed or pauses calls V() first, so the clock never jumps.
-    const pnow = performance.now.bind(performance), e0 = Date.now() - pnow(); let vc = pnow(), vl = vc;
+    const pnow = performance.now.bind(performance), e0 = Date.now() - pnow(); let vc = pnow(), vl = vc, OFF = null; // OFF: Download is making the video, and the clock is stepped by hand (below)
     const rate = () => KC.started && !KC.bursting ? (KC.playing ? (KC.pre ? 4 : KC.speed) : 0) : 1;
-    const V = () => { const n = pnow(); vc += (n - vl) * rate(); vl = n; return vc; };
+    const V = () => { if (OFF) return vc; const n = pnow(); vc += (n - vl) * rate(); vl = n; return vc; };
     Date.now = () => Math.floor(e0 + V()); performance.now = () => V(); // pixi's ticker starts from performance.now
-    const raf = window.requestAnimationFrame.bind(window);
-    window.requestAnimationFrame = cb => raf(() => cb(V()));
-    // the game's sound goes to the speakers and, for Save video, to a copy of the stream (its last node is connected to the output)
+    // frame callbacks: while the video is made offline they are held and run by hand, one batch for each video frame
+    const raf = window.requestAnimationFrame.bind(window), caf = window.cancelAnimationFrame.bind(window), pend = new Map(), held = new Map(); let hid = 1e9;
+    window.requestAnimationFrame = cb => { if (OFF) { held.set(++hid, cb); return hid; } const id = raf(t => { pend.delete(id); if (OFF) held.set(++hid, cb); else cb(V()); }); pend.set(id, cb); return id; };
+    window.cancelAnimationFrame = id => { held.delete(id); pend.delete(id); caf(id); };
+    // The game's sound is a WebAudio graph (client/src/lib/createJS.ts): a source for each sound, a gain and a panner of its own, the
+    // master gain, a compressor, the destination. To put the sound in a video without playing it in real time, the graph is written
+    // down as it is built: the nodes' connections (with the time each began and ended), every change of a gain, a pan or a filter, every
+    // source's start. While the video is made, the context's clock is the virtual one, so the game's own bookkeeping (a sound's end,
+    // the sounds it may play at once) runs as fast as the frames do; the speakers get nothing (a gain in front of the destination is
+    // 0), and afterwards the notes are replayed in an OfflineAudioContext. aoff: how far the virtual clock has run ahead of the real one.
+    const AG = { ne: new WeakMap(), nodes: new Set(), last: new WeakMap(), live: new Set(), sr: new WeakMap(), na: new WeakMap(), kg: new Set(), off: null, ctx: null, aoff: 0 };
     let tap = null;
-    try { const oc = AudioNode.prototype.connect; AudioNode.prototype.connect = function (d) { const r = oc.apply(this, arguments);
-      try { if (d instanceof AudioDestinationNode && !(tap && tap.context === this.context)) { const c = this.context; tap = { context: c, dest: c.createMediaStreamDestination() }; } if (d instanceof AudioDestinationNode) oc.call(this, tap.dest); } catch (e) {} return r; }; } catch (e) {}
+    try {
+      const AP = AudioParam.prototype, P0 = {}, oc = AudioNode.prototype.connect, od = AudioNode.prototype.disconnect, BA = BaseAudioContext.prototype, ct = Object.getOwnPropertyDescriptor(BA, 'currentTime');
+      AG.oc = oc; AG.od = od; AG.P0 = P0; AG.ct = ct;
+      AG.now = () => AG.off ? AG.off.ct0 + (vc - AG.off.v0) / 1000 : AG.ctx ? ct.get.call(AG.ctx) + AG.aoff : 0;
+      Object.defineProperty(BA, 'currentTime', { get() { AG.ctx = this; return AG.off ? AG.off.ct0 + (vc - AG.off.v0) / 1000 : ct.get.call(this) + AG.aoff; }, configurable: true });
+      const killOf = c => c.__vbk || (c.__vbk = (() => { const g = c.createGain(); oc.call(g, c.destination); AG.kg.add(g); return g; })());
+      AG.killOf = killOf;
+      const edge = (a, b, o, i) => { const e = { a, b, o: o | 0, i: i | 0, t0: AG.now(), t1: null }, l = AG.ne.get(a) || (AG.ne.set(a, []), AG.ne.get(a)); l.push(e); AG.nodes.add(a); if (AG.off) AG.off.edges.push(e); };
+      const shut = (a, f) => { const l = AG.ne.get(a); if (!l) return; for (let k = l.length - 1; k >= 0; k--) if (f(l[k])) { l[k].t1 = AG.now(); l.splice(k, 1); } if (!l.length && !AG.off) AG.nodes.delete(a); };
+      AudioNode.prototype.connect = function (d, o, i) { AG.ctx = this.context;
+        if (!(d instanceof AudioDestinationNode)) { const r = oc.apply(this, arguments); try { if (!(d instanceof AudioParam)) edge(this, d, o, i); } catch (e) {} return r; }
+        const k = killOf(this.context); oc.call(this, k, o); // the destination is reached through a gain, and a copy goes to the real-time recorder's stream (the fallback without VideoEncoder)
+        try { if (!(tap && tap.context === this.context)) { const c = this.context; tap = { context: c, dest: c.createMediaStreamDestination() }; } oc.call(this, tap.dest); edge(this, k, o, 0); } catch (e) {} return d; };
+      AudioNode.prototype.disconnect = function (d, o, i) { const a = arguments; let r;
+        if (d instanceof AudioDestinationNode) { const k = killOf(this.context); r = a.length > 1 ? od.call(this, k, o, i) : od.call(this, k); } else r = od.apply(this, a);
+        try { const k = d instanceof AudioDestinationNode ? killOf(this.context) : d;
+          shut(this, e => !a.length || (typeof d === 'number' ? e.o === d : e.b === k && (a.length < 2 || e.o === (o | 0)) && (a.length < 3 || e.i === (i | 0)))); } catch (e) {} return r; };
+      // a note of a change of a parameter: while the video is made the change goes to the notes only (the real graph is silent and stale)
+      const note = (p, m, a, t) => { const O = AG.off; if (O) { let r = O.ev.get(p); if (!r) O.ev.set(p, r = { v0: AG.last.has(p) ? AG.last.get(p) : p.value, list: [] }); r.list.push([m, Array.prototype.slice.call(a), t]); }
+        if (m === 'value' || m === 'setValueAtTime' || m === 'linearRampToValueAtTime' || m === 'exponentialRampToValueAtTime' || m === 'setTargetAtTime') AG.last.set(p, a[0]); };
+      const TI = { setValueAtTime: 1, linearRampToValueAtTime: 1, exponentialRampToValueAtTime: 1, setTargetAtTime: 1, setValueCurveAtTime: 1, cancelScheduledValues: 0, cancelAndHoldAtTime: 0 };
+      AG.TI = TI; for (const m of Object.keys(TI)) { const o = AP[m]; if (!o) continue; P0[m] = o;
+        AP[m] = function () { const a = arguments; note(this, m, a, 0); if (AG.off) return this; const b = Array.prototype.slice.call(a); b[TI[m]] = Math.max(0, b[TI[m]] - AG.aoff); return o.apply(this, b); }; } // never below 0: the game passes a literal 0 (createJS.ts Reverb.connect), and a negative time throws
+      const vd = Object.getOwnPropertyDescriptor(AP, 'value'); P0.value = vd;
+      Object.defineProperty(AP, 'value', { get: vd.get, set(v) { note(this, 'value', [v], AG.now()); if (!AG.off) vd.set.call(this, v); }, configurable: true });
+      if (typeof PannerNode !== 'undefined' && PannerNode.prototype.setPosition) { const sp = PannerNode.prototype.setPosition;
+        PannerNode.prototype.setPosition = function (x, y, z) { try { note(this.positionX, 'value', [x], AG.now()); note(this.positionY, 'value', [y], AG.now()); note(this.positionZ, 'value', [z], AG.now()); } catch (e) {} if (!AG.off) return sp.apply(this, arguments); }; }
+      for (const [fn, k] of [['createDelay', 'delay'], ['createChannelMerger', 'merger'], ['createChannelSplitter', 'splitter']]) { const o = BA[fn]; if (o) BA[fn] = function (n) { const r = o.apply(this, arguments); try { AG.na.set(r, n); } catch (e) {} return r; }; }
+      const ss = AudioBufferSourceNode.prototype.start, st = AudioBufferSourceNode.prototype.stop; AG.ss = ss;
+      AudioBufferSourceNode.prototype.start = function (when, offset, dur) { AG.ctx = this.context; const w = +when || 0, tw = Math.max(w, AG.now()), rec = { n: this, tw, off: +offset || 0, stopT: null };
+        AG.sr.set(this, rec); if (AG.off) AG.off.srcs.push(rec); else { AG.live.add(rec); try { this.addEventListener('ended', () => AG.live.delete(rec)); } catch (e) {} }
+        if (AG.off) return ss.call(this, 0, rec.off); return ss.call(this, w > 0 ? w - AG.aoff : 0, offset || 0, dur); };
+      AudioBufferSourceNode.prototype.stop = function (when) { const rec = AG.sr.get(this), w = +when || 0; if (rec) rec.stopT = Math.max(w, AG.now()); if (AG.off) return st.call(this, 0); return st.call(this, w > 0 ? w - AG.aoff : 0); };
+    } catch (e) { AG.broken = String(e && e.message || e); }
     // the death screen would cover the 2 s after; its buttons and the spectate buttons do nothing in a replay
     const css = () => { if (!document.head) { setTimeout(css, 20); return; } const st = document.createElement('style'); st.textContent = '#ui-stats,#ui-stats-bg{display:none!important}#ui-spectate-buttons{visibility:hidden!important}'; document.head.appendChild(st); }; css();
     function WS(url, protocols) {
@@ -126,22 +167,23 @@
     window.addEventListener('message', ev => { const d = ev.data; if (ev.origin !== location.origin || !window.opener || ev.source !== window.opener || !d || d.vbKillcam !== 1 || KC.data || !Array.isArray(d.frames)) return;
       const F = d.frames, first = F.length ? F[0][0] : 0, last = F.length ? F[F.length - 1][0] : 0;
       KC.first = first; KC.from = Math.min(last, Math.max(first, +d.from || first)); KC.to = Math.max(KC.from, Math.min(last, d.to == null ? last : +d.to));
-      KC.data = d; KC.want = { t: KC.from, play: false, rec: false }; begin(); });
+      KC.data = d; KC.want = { t: KC.from, play: true, rec: false }; begin(); }); // 1.7.0: the replay plays as soon as it is ready
     const ask = () => { try { if (window.opener && !KC.data) window.opener.postMessage({ vbKillcamReady: 1 }, location.origin); } catch (e) {} };
     ask(); const askT = setInterval(() => { if (KC.data) clearInterval(askT); else ask(); }, 1000); setTimeout(() => { clearInterval(askT); if (!KC.data) bar('no replay arrived: open it from the Death replay button'); }, 30000);
     const am = () => app && app.audioManager, wasMute = (() => { let m = null; return () => { if (m === null) { const a = am(); m = !!(a && a.mute); } return m; }; })();
     const mute = m => { try { const a = am(); if (a && typeof a.setMute === 'function') a.setMute(m || wasMute()); } catch (e) {} };
     function begin() { const s = KC.sock; if (!s || !KC.data || s.kcGo) return; s.kcGo = 1; const w = KC.want; run(w.t, w.play, w.rec); }
+    const giveTo = ab => { const s = KC.sock; if (s && s.readyState === 1 && s.onmessage) try { s.onmessage({ data: ab, type: 'message' }); } catch (e) {} };
     // play the copy up to t (at once, then 4x for its last 3 s), then wait there, or play on (play), or record from there (rec)
     function run(t, play, rec) {
       const g = ++KC.gen, s = KC.sock, F = KC.data.frames, pre = Math.max(KC.first, t - 3000);
       if (s.readyState === 0) { s.readyState = 1; try { s.onopen && s.onopen({ type: 'open' }); } catch (e) {} }
-      const give = ab => { if (s.readyState === 1 && s.onmessage) try { s.onmessage({ data: ab, type: 'message' }); } catch (e) {} };
+      const give = giveTo;
       let lv = 0; V(); KC.started = true; KC.bursting = true; KC.pre = false; KC.ready = false; KC.done = false; mute(true); bar();
       const burst = () => { if (g !== KC.gen) return; const stop = pnow() + 30; while (KC.i < F.length && F[KC.i][0] < pre && pnow() < stop) give(F[KC.i++][1]); bar();
         if (KC.i < F.length && F[KC.i][0] < pre) { setTimeout(burst, 0); return; }
         V(); KC.bursting = false; KC.pre = true; KC.playing = true; KC.vt = Math.max(KC.vt, pre); lv = vc; pump(); };
-      const pump = () => { if (g !== KC.gen) return; const v = V(); KC.vt += v - lv; lv = v;
+      const pump = () => { if (g !== KC.gen) return; if (OFF) { lv = V(); setTimeout(pump, 8); return; } const v = V(); KC.vt += v - lv; lv = v; // while Download steps the clock: follow it, or the next tick adds the whole render
         if (KC.pre && KC.vt >= t) { KC.vt = t; KC.pre = false; KC.speed = KC.user; KC.playing = false; KC.ready = true; mute(false);
           if (rec) record(); else if (play) { KC.playing = true; KC.went = true; } }
         if (KC.vt > KC.to) KC.vt = KC.to;
@@ -165,7 +207,7 @@
     const wantPlay = () => KC.ready ? !(KC.went && !KC.playing && !KC.done) : KC.want ? KC.want.play : true; // a seek keeps a pause
     function toggle() { if (!KC.ready || KC.rec) return; if (!KC.went) { go(false); return; } if (KC.done) { seek(KC.from, true); return; } V(); KC.playing = !KC.playing; bar(); }
     // the bar: where in the replay, pause, speed, back and on, the death, a loop, a video; a cover over the game while it catches up;
-    // at the start, Play or Save video
+    // and Download (1.7.0; no start panel: the replay plays as it opens)
     function bar(note) {
       if (!document.body) return; const D = KC.data;
       if (!KC.ui) { const u = KC.ui = {}; u.cover = document.createElement('div'); u.cover.style.cssText = 'position:fixed;inset:0;z-index:2147483646;background:#0d1117;color:#fff;display:flex;align-items:center;justify-content:center;font:700 22px system-ui,sans-serif';
@@ -181,44 +223,36 @@
         u.seek.oninput = () => { u.drag = true; }; u.seek.onchange = () => { u.drag = false; seek(+u.seek.value, wantPlay()); u.seek.blur(); }; u.box.appendChild(u.seek);
         u.sp = [0.25, 0.5, 1, 2].map(x => btn(x + 'x', () => { V(); KC.user = x; if (KC.ready) KC.speed = x; bar(); }));
         u.loop = btn('Loop', () => { KC.loop = !KC.loop; bar(); if (KC.loop && KC.done) seek(loopFrom(), true); }, null, false, 'play the death again and again');
-        u.vid = btn('● Video', () => { if (KC.rec) stopRec(); else go(true); }, null, false, 'save a video from here to the end, with sound');
+        u.vid = btn('Download', () => { if (KC.dl) KC.dl.cancel = true; else if (KC.rec) stopRec(); else download(); }, null, false, 'download the whole replay as a video, with sound');
         u.note = document.createElement('span'); u.note.style.cssText = 'color:#9be08a;font-weight:600'; u.box.appendChild(u.note);
         u.time = document.createElement('span'); u.time.style.cssText = 'min-width:64px;text-align:right;font-variant-numeric:tabular-nums'; u.box.appendChild(u.time);
-        u.start = document.createElement('div'); u.start.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;display:none;flex-direction:column;gap:12px;align-items:center;background:rgba(0,0,0,.78);color:#fff;font:600 14px system-ui,sans-serif;padding:22px 28px;border-radius:10px;text-align:center';
-        btn('▶ Play', () => go(false), u.start, true); btn('● Save video', () => go(true), u.start, true); u.skip = btn('⏭ Skip to the death', () => seek(loopFrom(), true), u.start, false);
-        // video size (1.4.3): Discord takes 10 MB from a free account, so that is the default; Best quality is 60 fps at 8 Mbps
-        u.q = document.createElement('select'); u.q.style.cssText = 'font:600 14px system-ui,sans-serif;padding:4px 6px;border-radius:4px';
-        [['discord', 'Video size: for Discord (under 10 MB)'], ['best', 'Video size: best quality (about 40 MB)']].forEach(([v, l]) => { const o = document.createElement('option'); o.value = v; o.textContent = l; u.q.appendChild(o); });
-        try { u.q.value = localStorage.getItem('observer.videoq') === 'best' ? 'best' : 'discord'; } catch (e) {}
-        u.q.onchange = () => { try { localStorage.setItem('observer.videoq', u.q.value); } catch (e) {} }; u.start.appendChild(u.q);
-        u.msg = document.createElement('div'); u.msg.style.cssText = 'max-width:340px;color:#ccc'; u.msg.textContent = 'Save video plays the replay and downloads it with its sound, from where it is to the end: no prompt. Pick the speed on the bar first: slower makes a longer video. On the bar: 5 s back or on, Death jumps to the 4 s before it.'; u.start.appendChild(u.msg);
-        document.body.appendChild(u.cover); document.body.appendChild(u.box); document.body.appendChild(u.start); }
+        document.body.appendChild(u.cover); document.body.appendChild(u.box); }
       const u = KC.ui, catching = !KC.started || KC.bursting || KC.pre;
       if (D && u.kind !== (D.clip ? 'clip' : 'death')) { u.kind = D.clip ? 'clip' : 'death'; const c = !!D.clip; // a saved clip (1.6.0): the same player, its own words
         u.title.textContent = c ? 'CLIP' : 'KILLCAM'; u.death.textContent = c ? 'Key press' : 'Death'; u.death.title = c ? 'the 4 s before you pressed the clip key' : 'the 4 s before your death';
-        u.skip.textContent = c ? '⏭ Skip to the key press' : '⏭ Skip to the death'; u.loop.title = c ? 'play the moment of the key press again and again' : 'play the death again and again';
-        if (c) u.msg.textContent = 'Save video plays the clip and downloads it with its sound, from where it is to the end: no prompt. Pick the speed on the bar first: slower makes a longer video. On the bar: 5 s back or on, Key press jumps to the 4 s before you pressed the key.'; }
+        u.loop.title = c ? 'play the moment of the key press again and again' : 'play the death again and again';
+        }
       u.cover.style.display = catching ? 'flex' : 'none';
       u.cover.textContent = note || (!D ? 'waiting for the replay...' : (KC.seeks ? 'rewinding... ' : D.clip ? 'loading your clip... ' : 'loading your death replay... ') + Math.round(100 * KC.i / Math.max(1, D.frames.length)) + '%');
-      u.start.style.display = KC.ready && !KC.playing && !KC.went ? 'flex' : 'none';
       u.play.textContent = KC.done ? 'Again' : KC.playing || !KC.went ? 'Pause' : 'Play';
       u.sp.forEach((b, k) => { b.style.background = [0.25, 0.5, 1, 2][k] === KC.user ? '#d9512c' : '#3a3f47'; });
       u.loop.style.background = KC.loop ? '#d9512c' : '#3a3f47';
-      u.vid.textContent = KC.rec ? '■ Stop' : '● Video'; u.vid.style.background = KC.rec ? '#c0392b' : '#3a3f47';
-      for (const b of [u.back0, u.back, u.fwd, u.death, u.seek]) b.disabled = !!KC.rec;
+      u.vid.textContent = KC.dl ? 'Cancel' : KC.rec ? '■ Stop' : canMake() ? 'Download' : '● Record (real time)'; u.vid.style.background = KC.rec || KC.dl ? '#c0392b' : '#3a3f47';
+      u.vid.title = canMake() ? 'download the whole replay as a video, with sound' : 'this browser cannot make the video faster than real time: it records the replay as it plays, from here to the end';
+      u.vid.disabled = catching && !KC.dl; for (const b of [u.back0, u.back, u.fwd, u.death, u.seek, u.play, u.loop].concat(u.sp)) b.disabled = !!KC.rec || !!KC.dl;
       if (D) { u.seek.min = KC.from; u.seek.max = KC.to; if (!u.drag) u.seek.value = KC.vt; }
-      if (KC.rec) u.note.textContent = '● REC';
+      if (KC.rec) u.note.textContent = '● REC'; else if (KC.dl) u.note.textContent = KC.dl.msg || 'making video';
       if (D && D.death != null) { const r = (KC.vt - D.death) / 1000; u.time.textContent = (r < 0 ? '-' : '+') + Math.abs(r).toFixed(1) + ' s'; }
     }
-    // Play, or Save video: the replay plays from where it is (at the end: from the start again); Save video records it as it plays and
-    // downloads the file at its end (mp4 where the browser can make one, else webm). Pressing Stop saves what was recorded.
+    // Play: the replay plays from where it is (at the end: from the start again). The real-time recorder (record(), the fallback behind
+    // Download where VideoEncoder or the muxer is missing) records it as it plays and downloads the file at its end. Stop saves what was recorded.
     async function go(rec) {
       if (!KC.data || KC.rec || !KC.ready) return;
       if (KC.done) { seek(KC.from, !rec, rec); return; }
       if (rec) { await record(); return; }
       V(); KC.went = true; KC.playing = true; bar();
     }
-    // Save video (1.5.0): the game's own picture (its canvas) with the HUD drawn on it from the page, and the game's own sound, so the
+    // The real-time recorder (1.5.0, now the fallback): the game's own picture (its canvas) with the HUD drawn on it from the page, and the game's own sound, so the
     // browser has nothing to ask (before 1.5.0 it recorded the tab, which needs the share prompt). The HUD is copied from where the page
     // shows it: the health and boost bars, ammo, players alive, the kill leader, the kill feed, who is spectated.
     const HUD_BOX = '#ui-health-container,#ui-health-depleted,#ui-health-actual,.ui-boost-base,.ui-boost-base .ui-bar-inner,.killfeed-div';
@@ -238,21 +272,18 @@
         x.font = '700 ' + f + 'px system-ui,sans-serif'; x.textAlign = 'center'; const w = x.measureText(s).width + f; x.fillStyle = 'rgba(0,0,0,.6)'; x.fillRect(C.cv.width / 2 - w / 2, 8 * k, w, f * 1.7); x.fillStyle = '#ff8a65'; x.fillText(s, C.cv.width / 2, 8 * k + f * 0.85); }
     }
     // one picture: the game's canvas as it was just drawn (a paused game draws nothing, so it is drawn again for the video), then the HUD
-    function comp() { const C = KC.cv; if (!C) return; if (!(KC.playing && KC.started && !KC.bursting)) try { app.pixi.render(); } catch (e) {}
+    function comp() { const C = KC.cv; if (!C) return; if (!KC.dl && !(KC.playing && KC.started && !KC.bursting)) try { app.pixi.render(); } catch (e) {}
       C.cx.globalAlpha = 1; C.cx.drawImage(C.view, 0, 0, C.cv.width, C.cv.height); try { hud(C); } catch (e) {} }
     // run after the game's own frame (frame callbacks run in the order they were asked for, and this one asks after the game's each time)
     const compLoop = () => { if (!KC.cv) return; try { comp(); } catch (e) {} raf(compLoop); };
     async function record() {
       const view = app && app.pixi && (app.pixi.view || app.pixi.renderer && app.pixi.renderer.view);
-      const say = m => { KC.ui.msg.textContent = m; KC.ui.note.textContent = m; bar(); };
+      const say = m => { KC.ui.note.textContent = m; bar(); };
       if (!view || typeof view.captureStream !== 'function' || !window.MediaRecorder) { say('No video: this browser cannot record. Play still works.'); return false; }
       // Chrome's encoder meets the asked bitrate at 30 fps and makes about twice it at 60 (measured 1.4.3). For Discord: 30 fps and the
       // bitrate that fits 9 MB in the recording's length at this speed (to the end and 1 s tail, 0.4 s lead in), less the sound.
-      const best = KC.ui.q && KC.ui.q.value === 'best', secs = Math.max(1, (KC.to - KC.vt) / 1000 / KC.user) + 1.4 + 1;
-      const vbps = best ? 8e6 : Math.round(Math.max(3e5, Math.min(6e6, 9e6 * 8 * 0.95 / secs - 128e3)));
-      const sc = Math.min(1, (best ? 1920 : 1280) / Math.max(1, view.width)), cv = document.createElement('canvas');
-      cv.width = Math.max(2, Math.round(view.width * sc / 2) * 2); cv.height = Math.max(2, Math.round(view.height * sc / 2) * 2);
-      let tracks; try { KC.cv = { cv, cx: cv.getContext('2d'), view }; comp(); tracks = cv.captureStream(best ? 60 : 30).getVideoTracks(); } catch (e) { KC.cv = null; say('No video: ' + (e && e.message || e) + '. Play still works.'); return false; }
+      const secs = Math.max(1, (KC.to - KC.vt) / 1000 / KC.user) + 1.4 + 1, vbps = Math.round(Math.max(3e5, Math.min(6e6, 9e6 * 8 * 0.95 / secs - 128e3))), cv = canvasFor(view);
+      let tracks; try { KC.cv = { cv, cx: cv.getContext('2d'), view }; comp(); tracks = cv.captureStream(30).getVideoTracks(); } catch (e) { KC.cv = null; say('No video: ' + (e && e.message || e) + '. Play still works.'); return false; }
       if (tap) { try { if (tap.context.state !== 'running') await Promise.race([tap.context.resume(), new Promise(r => setTimeout(r, 400))]); } catch (e) {}
         if (tap.context.state === 'running') tracks = tracks.concat(tap.dest.stream.getAudioTracks()); }
       const audio = tracks.length > 1, s = new MediaStream(tracks);
@@ -260,15 +291,117 @@
       let mr; try { mr = new MediaRecorder(s, type ? { mimeType: type, videoBitsPerSecond: vbps, audioBitsPerSecond: 128e3 } : undefined); } catch (e) { s.getVideoTracks().forEach(x => x.stop()); KC.cv = null; say('No video: this browser cannot record. Play still works.'); return false; }
       const parts = []; KC.rec = { mr, s, type: mr.mimeType || type || 'video/webm', audio }; mr.ondataavailable = e => { if (e.data && e.data.size) parts.push(e.data); };
       mr.onstop = () => { const ty = KC.rec ? KC.rec.type : 'video/webm', a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(parts, { type: ty }));
-        a.download = (KC.data && KC.data.clip ? 'survev-clip-' : 'survev-death-replay-') + new Date(D0()).toISOString().slice(0, 19).replace(/[T:]/g, '-') + (/mp4/.test(ty) ? '.mp4' : '.webm'); document.body.appendChild(a); a.click(); a.remove();
+        a.download = fname(/mp4/.test(ty) ? '.mp4' : '.webm'); document.body.appendChild(a); a.click(); a.remove();
         const mb = parts.reduce((n, p) => n + p.size, 0) / 1e6; KC.saved = mb; KC.rec = null; KC.cv = null; s.getVideoTracks().forEach(x => x.stop()); // the sound's stream stays for the next video
-        bar(); KC.ui.note.textContent = 'Saved ' + mb.toFixed(1) + ' MB' + (audio ? '' : ' (no sound: click the page once, then save again)') + (mb > 10 ? ': too big for a free Discord account. Pick "for Discord" on the start panel (Restart: the first button), save again' : ''); };
+        bar(); KC.ui.note.textContent = 'Saved ' + mb.toFixed(1) + ' MB' + (audio ? '' : ' (no sound: click the page once, then save again)') + (mb > 10 ? ': too big for a free Discord account' : ''); };
       mr.start(1000); raf(compLoop);
       KC.went = true; bar(); await new Promise(r => setTimeout(r, 400)); // the recording has its first frames before the replay moves
       V(); KC.playing = true; bar(); return true;
     }
+    const fname = ext => (KC.data && KC.data.clip ? 'survev-clip-' : 'survev-death-replay-') + new Date(D0()).toISOString().slice(0, 19).replace(/[T:]/g, '-') + ext;
+    const canvasFor = view => { const sc = Math.min(1, 1280 / Math.max(1, view.width)), cv = document.createElement('canvas'); cv.width = Math.max(2, Math.round(view.width * sc / 2) * 2); cv.height = Math.max(2, Math.round(view.height * sc / 2) * 2); return cv; };
+    // Download (1.7.0): the whole replay as a video, made without playing it in real time. The replay is rebuilt at its start, then the
+    // virtual clock is stepped by hand, 1/30 s for each video frame: the socket messages due by then go to the game, the frame
+    // callbacks the wrapped requestAnimationFrame held run with that time, comp() draws the picture and the HUD, and a WebCodecs
+    // VideoEncoder takes it. The sound is rebuilt from the notes of the audio graph (above) in an OfflineAudioContext and goes through
+    // an AudioEncoder. mp4-muxer (the @require at the top) puts them in one file. Afterwards the replay is put back where it was.
+    const FPS = 30, STEP = 1000 / FPS, yld = () => new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); }), sleep = ms => new Promise(r => setTimeout(r, ms));
+    const canMake = () => typeof VideoEncoder === 'function' && typeof VideoFrame === 'function' && typeof Mp4Muxer === 'object' && Mp4Muxer && typeof Mp4Muxer.Muxer === 'function' && !AG.broken && !KC.noEnc;
+    async function pickVideo(w, h, bps) { // H.264 where there is an encoder (the level 3.1 and up are the ones that take 1280x720), else VP9, which the same muxer takes
+      for (const [c, m] of [['avc1.42E01F', 'avc'], ['avc1.4D401F', 'avc'], ['avc1.640028', 'avc'], ['avc1.42E01E', 'avc'], ['vp09.00.31.08', 'vp9']]) { const cfg = { codec: c, width: w, height: h, bitrate: bps, framerate: FPS }; if (m === 'avc') cfg.avc = { format: 'avc' };
+        try { if ((await VideoEncoder.isConfigSupported(cfg)).supported) return { cfg, m }; } catch (e) {} } return null; }
+    async function pickAudio(sr) { if (typeof AudioEncoder !== 'function' || typeof AudioData !== 'function') return null;
+      for (const [c, m] of [['mp4a.40.2', 'aac'], ['opus', 'opus']]) { const cfg = { codec: c, sampleRate: sr, numberOfChannels: 2, bitrate: 128000 }; try { if ((await AudioEncoder.isConfigSupported(cfg)).supported) return { cfg, m }; } catch (e) {} } return null; }
+    // the sound: the notes of the graph replayed in an OfflineAudioContext (see the audio notes above); returns {buf, srcs, unk} or {why}
+    async function audioRender(O, secs) {
+      const srcs = O.srcs.filter(r => r.n.buffer); if (!srcs.length) return { why: 'the replay made no sound' };
+      const sr = srcs[0].n.context.sampleRate, off = new OfflineAudioContext(2, Math.max(1, Math.round(secs * sr)), sr), { oc, od, P0, ss } = AG, T0 = O.ct0, map = new Map(); let unk = 0;
+      const PR = ['channelCountMode', 'channelCount', 'channelInterpretation', 'panningModel', 'distanceModel', 'refDistance', 'maxDistance', 'rolloffFactor', 'coneInnerAngle', 'coneOuterAngle', 'coneOuterGain', 'normalize', 'buffer', 'type', 'loop', 'loopStart', 'loopEnd'];
+      const tt = t => Math.max(0, t - T0);
+      const node = n => { if (AG.kg.has(n)) return off.destination; let c = map.get(n); if (c) return c; const k = n.constructor.name;
+        try { c = k === 'GainNode' ? off.createGain() : k === 'PannerNode' ? off.createPanner() : k === 'StereoPannerNode' ? off.createStereoPanner() : k === 'ConvolverNode' ? off.createConvolver() : k === 'BiquadFilterNode' ? off.createBiquadFilter()
+          : k === 'DynamicsCompressorNode' ? off.createDynamicsCompressor() : k === 'DelayNode' ? off.createDelay(n.delayTime.maxValue || 1) : k === 'ChannelMergerNode' ? off.createChannelMerger(AG.na.get(n) || 6) : k === 'ChannelSplitterNode' ? off.createChannelSplitter(AG.na.get(n) || 6)
+          : k === 'AudioBufferSourceNode' ? off.createBufferSource() : null; } catch (e) { c = null; }
+        if (!c) { c = off.createGain(); unk++; map.set(n, c); return c; }
+        for (const p of PR) if (p in c && p in n) { try { const v = n[p]; if (c[p] !== v) c[p] = v; } catch (e) {} }
+        for (const key in c) { let cp; try { cp = c[key]; } catch (e) { continue; } if (!(cp instanceof AudioParam)) continue; const op = n[key], ev = O.ev.get(op); if (!op) continue;
+          try { P0.value.set.call(cp, ev ? ev.v0 : AG.last.has(op) ? AG.last.get(op) : op.value); } catch (e) {}
+          if (ev) for (const [m, a, t] of ev.list) { try { const b = a.slice(); if (m === 'value') P0.setValueAtTime.call(cp, b[0], tt(t)); else { b[AG.TI[m]] = tt(b[AG.TI[m]]); P0[m].apply(cp, b); } } catch (e) {} } }
+        map.set(n, c); return c; };
+      // the times in the notes are on the virtual clock; tt() takes the render's start off them
+      let played = 0;
+      for (const r of srcs) { const c = node(r.n), ts = r.tw - T0, el = Math.max(0, -ts); let o = r.off + el; const d = r.n.buffer.duration;
+        if (r.n.loop) o = d ? o % d : 0; else if (o >= d) { continue; } try { ss.call(c, Math.max(0, ts), o); if (r.stopT != null) c.stop(Math.max(0, r.stopT - T0)); played++; } catch (e) {} }
+      const ch = []; for (const e of O.edges) { const ta = e.t0 - T0, tb = e.t1 == null ? Infinity : e.t1 - T0; if (tb <= 0) continue; ch.push([Math.max(0, ta), 1, e]); if (tb < secs) ch.push([tb, 0, e]); }
+      ch.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+      const act = ([, c, e]) => { const a = node(e.a), b = node(e.b); try { if (c) oc.call(a, b, e.o, b === off.destination ? 0 : e.i); else od.call(a, b, e.o, b === off.destination ? 0 : e.i); } catch (er) {} };
+      for (const x of ch) { node(x[2].a); node(x[2].b); } // all the nodes first, so their notes are all in before the render starts
+      const q = t => Math.floor(t * sr / 128) * 128 / sr, groups = new Map(); for (const x of ch) { const k = q(x[0]); (groups.get(k) || groups.set(k, []).get(k)).push(x); }
+      for (const x of groups.get(0) || []) act(x); groups.delete(0);
+      const times = [...groups.keys()].sort((a, b) => a - b).filter(t => t < secs), sus = times.map(t => off.suspend(t)), run = off.startRendering();
+      for (let k = 0; k < times.length; k++) { await sus[k]; for (const x of groups.get(times[k])) act(x); off.resume(); }
+      return { buf: await run, srcs: played, unk };
+    }
+    async function download() {
+      if (!KC.data || KC.dl || KC.rec || !KC.ready) return;
+      if (!canMake()) { go(true); return; } // no WebCodecs or no muxer: the old way, in real time
+      { const v0 = app && app.pixi && (app.pixi.view || app.pixi.renderer && app.pixi.renderer.view), c0 = v0 && canvasFor(v0); if (c0 && !await pickVideo(c0.width, c0.height, 3e6)) { KC.noEnc = true; bar(); go(true); return; } } // WebCodecs but no setting this browser can encode: the same
+      const keep = { t: KC.vt, play: KC.playing && !KC.done }, D = KC.dl = { cancel: false, msg: 'making video 0%' }, w0 = pnow(), info = KC.dlInfo = { ok: false };
+      V(); KC.playing = false; bar();
+      let enc = null, aenc = null, err = null;
+      try {
+        const view = app && app.pixi && (app.pixi.view || app.pixi.renderer && app.pixi.renderer.view); if (!view) throw new Error('no picture');
+        // to the start of the replay (where the video starts), paused
+        seek(KC.from, false); while (!KC.ready || Math.abs(KC.vt - KC.from) > 1.5) { if (D.cancel) throw new Error('cancelled'); await sleep(20); }
+        const F = KC.data.frames, T1 = KC.vt, N = Math.max(1, Math.round((KC.to - T1) / STEP)), secs = N / FPS, cv = canvasFor(view);
+        const vbps = Math.round(Math.max(3e5, Math.min(8e6, 9e6 * 8 * 0.93 / secs - 128e3))), V0 = await pickVideo(cv.width, cv.height, vbps); if (!V0) throw new Error('this browser has no video encoder for ' + cv.width + 'x' + cv.height);
+        info.codec = V0.cfg.codec; info.frames = N; info.bitrate = vbps;
+        const arate = AG.ctx ? AG.ctx.sampleRate : 48000, A0 = await pickAudio(arate), tgt = new Mp4Muxer.ArrayBufferTarget();
+        const mux = new Mp4Muxer.Muxer({ target: tgt, video: { codec: V0.m, width: cv.width, height: cv.height, frameRate: FPS }, audio: A0 ? { codec: A0.m, numberOfChannels: 2, sampleRate: arate } : undefined, fastStart: 'in-memory', firstTimestampBehavior: 'offset' });
+        enc = new VideoEncoder({ output: (c, m) => { try { mux.addVideoChunk(c, m); } catch (e) { err = e; } }, error: e => { err = e; } }); enc.configure(V0.cfg);
+        KC.cv = { cv, cx: cv.getContext('2d'), view };
+        // the clock is the replay's, by hand: the real sound goes silent (the gain before the destination) and the frame callbacks are held
+        const user = KC.speed; KC.speed = 1; KC.playing = true; const v0 = vc;
+        for (const g of AG.kg) try { AG.P0.value.set.call(g.gain, 0); } catch (e) {}
+        const O = AG.off = { ct0: AG.now(), v0, srcs: [...AG.live], edges: [], ev: new Map() }; for (const n of AG.nodes) for (const e of AG.ne.get(n) || []) if (e.t1 == null) O.edges.push(e);
+        OFF = { v0 }; for (const [id, cb] of pend) { caf(id); held.set(id, cb); } pend.clear();
+        try {
+          for (let k = 0; k < N; k++) {
+            if (D.cancel) throw new Error('cancelled'); if (err) throw err;
+            vc = v0 + k * STEP; KC.vt = Math.min(KC.to, T1 + k * STEP);
+            while (KC.i < F.length && F[KC.i][0] <= KC.vt) giveTo(F[KC.i++][1]);
+            const q = [...held.values()]; held.clear(); for (const cb of q) try { cb(vc); } catch (e) {}
+            comp(); const fr = new VideoFrame(cv, { timestamp: Math.round(k * 1e6 / FPS), duration: Math.round(1e6 / FPS) }); enc.encode(fr, { keyFrame: k % 60 === 0 }); fr.close();
+            if (k % 4 === 3) { while (enc.encodeQueueSize > 6) await yld(); await yld(); D.msg = 'making video ' + Math.floor(90 * k / N) + '%'; bar(); }
+          }
+        } finally { // the real clock and frame loop go on from here
+          O.ct1 = AG.now(); AG.off = null; OFF = null; vl = pnow(); KC.speed = user; KC.playing = false; for (const g of AG.kg) try { AG.P0.value.set.call(g.gain, 1); } catch (e) {} // paused while the file is put together; seek() below puts back play or pause
+          if (AG.ctx) { const real = AG.ct.get.call(AG.ctx); AG.aoff = O.ct1 - real; }
+          for (const cb of [...held.values()]) window.requestAnimationFrame(cb); held.clear(); KC.cv = null; }
+        await enc.flush(); if (err) throw err; if (D.cancel) throw new Error('cancelled');
+        // the sound
+        info.audio = null; info.why = null; D.msg = 'making video 92%'; bar();
+        if (!A0) info.why = 'this browser has no sound encoder';
+        else if (AG.broken) info.why = 'the audio graph could not be followed (' + AG.broken + ')';
+        else { let R; try { R = await audioRender(O, secs); } catch (e) { R = { why: 'the sound could not be rebuilt (' + (e && e.message || e) + ')' }; }
+          if (R.why) info.why = R.why; else { const b = R.buf, pk = (() => { let m = 0; for (let c = 0; c < b.numberOfChannels; c++) { const d = b.getChannelData(c); for (let i = 0; i < d.length; i += 7) m = Math.max(m, Math.abs(d[i])); } return m; })(); info.peak = pk; info.srcs = R.srcs; info.unk = R.unk;
+            if (pk < 1e-4) info.why = 'the sounds in this replay were silent'; else {
+              aenc = new AudioEncoder({ output: (c, m) => { try { mux.addAudioChunk(c, m); } catch (e) { err = e; } }, error: e => { err = e; } }); aenc.configure(A0.cfg);
+              const L = b.getChannelData(0), Rr = b.numberOfChannels > 1 ? b.getChannelData(1) : L, CH = 4800;
+              for (let o = 0; o < L.length; o += CH) { const n = Math.min(CH, L.length - o), d = new Float32Array(n * 2); d.set(L.subarray(o, o + n)); d.set(Rr.subarray(o, o + n), n);
+                const ad = new AudioData({ format: 'f32-planar', sampleRate: b.sampleRate, numberOfFrames: n, numberOfChannels: 2, timestamp: Math.round(o * 1e6 / b.sampleRate), data: d }); aenc.encode(ad); ad.close(); if ((o / CH) % 8 === 7) await yld(); }
+              await aenc.flush(); if (err) throw err; info.audio = A0.cfg.codec; } } }
+        if (D.cancel) throw new Error('cancelled'); mux.finalize(); const blob = new Blob([tgt.buffer], { type: 'video/mp4' }), a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+        a.download = fname('.mp4'); document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+        info.ok = true; info.bytes = blob.size; info.wall = (pnow() - w0) / 1000; info.secs = secs;
+        KC.saved = blob.size / 1e6; KC.ui.note.textContent = 'Saved ' + (blob.size / 1e6).toFixed(1) + ' MB' + (info.audio ? '' : ' (no sound: ' + info.why + ')');
+      } catch (e) { info.err = String(e && e.message || e); KC.ui.note.textContent = info.err === 'cancelled' ? 'Cancelled' : 'No video: ' + info.err; }
+      try { if (enc && enc.state !== 'closed') enc.close(); if (aenc && aenc.state !== 'closed') aenc.close(); } catch (e) {}
+      const note = KC.ui.note.textContent; KC.dl = null; KC.cv = null; seek(keep.t, keep.play); bar(); KC.ui.note.textContent = note; info.done = true;
+    }
     const D0 = () => { const D = KC.data; return D && D.openEpoch ? D.openEpoch + (D.death || 0) - (D.frames.length ? D.frames[0][0] : 0) : e0 + pnow(); };
     function stopRec() { const r = KC.rec; if (r && r.mr.state !== 'inactive') try { r.mr.stop(); } catch (e) {} }
+    window.__killcamDownload = download; // tools/test-observer-killcam-download.js presses Download
     window.__killcamGo = go; // tools/test-observer-killcam.js presses Play
     window.__killcamSeek = seek; // tools/test-observer-killcam-seek.js goes back and on
     try { Object.defineProperty(window, '__killcamApp', { get: () => app }); } catch (e) {} // the same test finds the game's camera
