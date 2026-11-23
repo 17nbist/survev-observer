@@ -41,7 +41,23 @@ Without a copy (you installed or turned on the script after the match started), 
 [clip jury](https://clip-jury.pages.dev/)'s map replay instead, made from the script's notes of the last minute: everyone your game
 could see, the player who killed you ringed, and "Save video".
 
-It is one file of about 500 lines. Read it before you install it.
+## Save a clip (from 1.6.0)
+
+Saw something that looked like a cheater? Press your clip key: the script keeps the 20 seconds before the press and the 10 seconds
+after it, to watch the same way as a death replay (Video included). You hear a short beep; press again while it is still saving and
+the clip goes on to 10 seconds after that press (two beeps), up to 60 seconds in all. A low tone says it is saved.
+
+- **Pick the key**: there is none until you pick one. The menu shows an orange bar the first time (**Set key**, then press a key or
+  a mouse side button), and survev's own **Settings > Keybinds** has a **Save clip (observer)** row to change it later (Esc cancels,
+  Backspace removes it). A key the game already uses works too: you get a warning, and both happen.
+- **Watch**: click **▶ N clips** next to the label in the bottom left corner at any time, or **Saved clips** on the results screen.
+- 5 clips a match and the 10 newest in all are kept, in that tab only. Close the tab and they are gone; save a video to keep one.
+
+The script only listens for that one key: your game gets it as before, and the script never presses, holds or changes any input.
+The clip itself is never uploaded. What is sent is one small line per press, with the time and the clip's number (see below), so
+the clip jury can look first at the moments players pointed at.
+
+It is one file of about 800 lines. Read it before you install it.
 
 ## What it sends
 
@@ -52,6 +68,7 @@ Every 10 seconds, zipped, to `https://survev-observer.pages.dev/api/upload`:
 - bullets when they appear, kills from the kill feed, explosions, emotes and map pings, obstacles (once, then when they break or a door
   opens), smoke
 - who you spectate after you die
+- when you press your clip key (from 1.6.0): the time of the press and the clip's number, nothing else
 
 - only if you are signed in to a survev.io account: the game's id (see below)
 
@@ -87,6 +104,8 @@ name. If you do not want that, sign out of survev.io or pause the script (click 
 2. The game renames its fields when it is built, so the script finds what it needs by shape (a list of players, an object with four position fields, and so on) and remembers the names.
 3. On each world update from the server, it writes one line of numbers. Every 10 seconds it zips the lines and sends them.
 4. It keeps a copy of the game socket's messages for the killcam (part 0 of the file); it never sends that copy.
+5. Your clip key (part 5) cuts a clip out of that same copy; it listens for that key only, and holds a press back only while you
+   are picking the key.
 
 `server/` is the upload endpoint (Cloudflare Pages Functions and a D1 table). Batches stay there until they are pulled into the
 clip jury's data, then they are deleted.

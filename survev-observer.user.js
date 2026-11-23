@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.5.0
-// @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters, and replays your death through the game itself. It changes nothing in your game.
+// @version      1.6.0
+// @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters, replays your death through the game itself, and saves a clip of the last 20 seconds on a key you pick. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
 // @grant        none
@@ -24,6 +24,10 @@
 //     your stats page) and finds that match's game id, and sends that id. A report to the game's moderators needs it. Your account's
 //     name is used for that one question to survev.io and is never sent to us; but the game id points at the game's public stats page,
 //     where every player's name is, yours too. Not signed in: this step never runs.
+//  6. A clip key (1.6.0, none until you pick one on the menu or in Settings > Keybinds): pressing it keeps the 20 s before and the
+//     10 s after from that same copy, in this tab, to watch like a death replay (part 5 below). The clip is never uploaded; one small
+//     line is (C: when you pressed it), so the clip jury can look at the moments players point at. The key is only listened for: the
+//     game still gets it as before.
 // It sends nothing else about you beyond what is in the game (no name, no account, no browser data). The badge in the bottom left
 // corner shows that it is on and how much it sent; click it to pause or resume. See README.md for the full list.
 
@@ -31,7 +35,7 @@
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
   const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
-  const VERSION = 'observer-1.5.0', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
+  const VERSION = 'observer-1.6.0', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
 
   // ---------- 0. a copy of the game's socket, and the killcam ----------
   // The approach of "Surviv.io input replay recorder" (greasyfork.org/scripts/447501, MIT, by garlic, samer kizi and preacher):
@@ -39,6 +43,7 @@
   // its time. It changes, delays and sends nothing: the game gets each message exactly as before, and the copy never leaves this
   // tab. The Death replay button hands it to a killcam tab (killcam() below), where the game's own client plays it back.
   const NativeWS = typeof window.WebSocket === 'function' ? window.WebSocket : null, KC_URL = 'wss://vb-killcam.invalid/play', KC_BEFORE = 20000, KC_AFTER = 2000, WIRE_MAX = 64e6;
+  const CLIP_BEFORE = 20000, CLIP_AFTER = 10000, CLIP_LONG = 60000, CLIP_MATCH = 5, CLIP_ALL = 10; // a saved clip (part 5): 20 s before the press, 10 after the last one, 60 s in all at most; 5 a match, 10 kept
   // a killcam tab is known by its link alone: ?u= is the stand-in address (never a #hash, which the game reads as a team to join)
   const KILLCAM = (() => { try { const u = new URLSearchParams(location.search).get('u'); return !!u && atob(u) === KC_URL; } catch (e) { return false; } })();
   let wire = null; // the game socket of this match: {url, openEpoch, t0, frames: [[performance.now(), ArrayBuffer]], bytes}
@@ -180,7 +185,7 @@
         u.note = document.createElement('span'); u.note.style.cssText = 'color:#9be08a;font-weight:600'; u.box.appendChild(u.note);
         u.time = document.createElement('span'); u.time.style.cssText = 'min-width:64px;text-align:right;font-variant-numeric:tabular-nums'; u.box.appendChild(u.time);
         u.start = document.createElement('div'); u.start.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;display:none;flex-direction:column;gap:12px;align-items:center;background:rgba(0,0,0,.78);color:#fff;font:600 14px system-ui,sans-serif;padding:22px 28px;border-radius:10px;text-align:center';
-        btn('▶ Play', () => go(false), u.start, true); btn('● Save video', () => go(true), u.start, true); btn('⏭ Skip to the death', () => seek(loopFrom(), true), u.start, false);
+        btn('▶ Play', () => go(false), u.start, true); btn('● Save video', () => go(true), u.start, true); u.skip = btn('⏭ Skip to the death', () => seek(loopFrom(), true), u.start, false);
         // video size (1.4.3): Discord takes 10 MB from a free account, so that is the default; Best quality is 60 fps at 8 Mbps
         u.q = document.createElement('select'); u.q.style.cssText = 'font:600 14px system-ui,sans-serif;padding:4px 6px;border-radius:4px';
         [['discord', 'Video size: for Discord (under 10 MB)'], ['best', 'Video size: best quality (about 40 MB)']].forEach(([v, l]) => { const o = document.createElement('option'); o.value = v; o.textContent = l; u.q.appendChild(o); });
@@ -189,8 +194,12 @@
         u.msg = document.createElement('div'); u.msg.style.cssText = 'max-width:340px;color:#ccc'; u.msg.textContent = 'Save video plays the replay and downloads it with its sound, from where it is to the end: no prompt. Pick the speed on the bar first: slower makes a longer video. On the bar: 5 s back or on, Death jumps to the 4 s before it.'; u.start.appendChild(u.msg);
         document.body.appendChild(u.cover); document.body.appendChild(u.box); document.body.appendChild(u.start); }
       const u = KC.ui, catching = !KC.started || KC.bursting || KC.pre;
+      if (D && u.kind !== (D.clip ? 'clip' : 'death')) { u.kind = D.clip ? 'clip' : 'death'; const c = !!D.clip; // a saved clip (1.6.0): the same player, its own words
+        u.title.textContent = c ? 'CLIP' : 'KILLCAM'; u.death.textContent = c ? 'Key press' : 'Death'; u.death.title = c ? 'the 4 s before you pressed the clip key' : 'the 4 s before your death';
+        u.skip.textContent = c ? '⏭ Skip to the key press' : '⏭ Skip to the death'; u.loop.title = c ? 'play the moment of the key press again and again' : 'play the death again and again';
+        if (c) u.msg.textContent = 'Save video plays the clip and downloads it with its sound, from where it is to the end: no prompt. Pick the speed on the bar first: slower makes a longer video. On the bar: 5 s back or on, Key press jumps to the 4 s before you pressed the key.'; }
       u.cover.style.display = catching ? 'flex' : 'none';
-      u.cover.textContent = note || (!D ? 'waiting for the replay...' : (KC.seeks ? 'rewinding... ' : 'loading your death replay... ') + Math.round(100 * KC.i / Math.max(1, D.frames.length)) + '%');
+      u.cover.textContent = note || (!D ? 'waiting for the replay...' : (KC.seeks ? 'rewinding... ' : D.clip ? 'loading your clip... ' : 'loading your death replay... ') + Math.round(100 * KC.i / Math.max(1, D.frames.length)) + '%');
       u.start.style.display = KC.ready && !KC.playing && !KC.went ? 'flex' : 'none';
       u.play.textContent = KC.done ? 'Again' : KC.playing || !KC.went ? 'Pause' : 'Play';
       u.sp.forEach((b, k) => { b.style.background = [0.25, 0.5, 1, 2][k] === KC.user ? '#d9512c' : '#3a3f47'; });
@@ -225,7 +234,7 @@
         x.globalAlpha = a; x.font = st.fontWeight + ' ' + Math.max(8, Math.round(parseFloat(st.fontSize) * k)) + 'px ' + st.fontFamily; x.textAlign = /center|right/.test(st.textAlign) ? st.textAlign : 'left';
         const px = x.textAlign === 'center' ? l + w / 2 : x.textAlign === 'right' ? l + w : l; x.lineWidth = 3 * k; x.strokeStyle = 'rgba(0,0,0,.55)'; x.strokeText(tx, px, t + h / 2); x.fillStyle = st.color; x.fillText(tx, px, t + h / 2); }
       x.globalAlpha = 1; const D = KC.data; // the killcam's own label: the time to the death
-      if (D && D.death != null) { const r = (KC.vt - D.death) / 1000, s = 'KILLCAM  ' + (r < 0 ? '-' : '+') + Math.abs(r).toFixed(1) + ' s' + (KC.speed !== 1 ? '  ' + KC.speed + 'x' : ''), f = Math.round(16 * k);
+      if (D && D.death != null) { const r = (KC.vt - D.death) / 1000, s = (D.clip ? 'CLIP  ' : 'KILLCAM  ') + (r < 0 ? '-' : '+') + Math.abs(r).toFixed(1) + ' s' + (KC.speed !== 1 ? '  ' + KC.speed + 'x' : ''), f = Math.round(16 * k);
         x.font = '700 ' + f + 'px system-ui,sans-serif'; x.textAlign = 'center'; const w = x.measureText(s).width + f; x.fillStyle = 'rgba(0,0,0,.6)'; x.fillRect(C.cv.width / 2 - w / 2, 8 * k, w, f * 1.7); x.fillStyle = '#ff8a65'; x.fillText(s, C.cv.width / 2, 8 * k + f * 0.85); }
     }
     // one picture: the game's canvas as it was just drawn (a paused game draws nothing, so it is drawn again for the video), then the HUD
@@ -251,7 +260,7 @@
       let mr; try { mr = new MediaRecorder(s, type ? { mimeType: type, videoBitsPerSecond: vbps, audioBitsPerSecond: 128e3 } : undefined); } catch (e) { s.getVideoTracks().forEach(x => x.stop()); KC.cv = null; say('No video: this browser cannot record. Play still works.'); return false; }
       const parts = []; KC.rec = { mr, s, type: mr.mimeType || type || 'video/webm', audio }; mr.ondataavailable = e => { if (e.data && e.data.size) parts.push(e.data); };
       mr.onstop = () => { const ty = KC.rec ? KC.rec.type : 'video/webm', a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(parts, { type: ty }));
-        a.download = 'survev-death-replay-' + new Date(D0()).toISOString().slice(0, 19).replace(/[T:]/g, '-') + (/mp4/.test(ty) ? '.mp4' : '.webm'); document.body.appendChild(a); a.click(); a.remove();
+        a.download = (KC.data && KC.data.clip ? 'survev-clip-' : 'survev-death-replay-') + new Date(D0()).toISOString().slice(0, 19).replace(/[T:]/g, '-') + (/mp4/.test(ty) ? '.mp4' : '.webm'); document.body.appendChild(a); a.click(); a.remove();
         const mb = parts.reduce((n, p) => n + p.size, 0) / 1e6; KC.saved = mb; KC.rec = null; KC.cv = null; s.getVideoTracks().forEach(x => x.stop()); // the sound's stream stays for the next video
         bar(); KC.ui.note.textContent = 'Saved ' + mb.toFixed(1) + ' MB' + (audio ? '' : ' (no sound: click the page once, then save again)') + (mb > 10 ? ': too big for a free Discord account. Pick "for Discord" on the start panel (Restart: the first button), save again' : ''); };
       mr.start(1000); raf(compLoop);
@@ -325,7 +334,8 @@
   // One JSON array per line, the same format the clip jury reads: M match start, m the map, u one world update (you and every
   // player in view), b a bullet, o an obstacle, K a kill, F/f smoke, X an explosion, e an emote, n a map ping, I team ids, S who you
   // watch after you die, D your death,
-  // E match end, s names (weapons, gear, obstacle types) as numbers, G the game's id (part 4, signed-in players only).
+  // E match end, s names (weapons, gear, obstacle types) as numbers, G the game's id (part 4, signed-in players only), C a press of
+  // the clip key (part 5: the time and the clip's number).
   const r2 = v => (typeof v === 'number' ? Math.round(v * 100) / 100 : 0), r4 = v => (typeof v === 'number' ? Math.round(v * 1e4) / 1e4 : 0);
   const dir8 = d => (isVec(d) ? Math.round((Math.atan2(d.y, d.x) + Math.PI) / (2 * Math.PI) * 255) : 0);
   const sess = Math.random().toString(36).slice(2, 12);
@@ -342,6 +352,7 @@
   function str(s) { if (typeof s !== 'string' || !s) return 0; let i = strings.get(s); if (i === undefined) { i = strings.size + 1; strings.set(s, i); push(['s', i, s]); } return i; }
 
   function matchStart(g, me) {
+    clipEnd(); // an open clip ends with its match (part 5)
     inMatch = true; match++; startT = now(); myId = me.__id; watching = 0; lastUpdate = 0; wasDead = false; infoSig = ''; rp = []; rpPruned = 0; rpSnap = null; wireSnap = null; diedAt = 0; died = false; for (const k in names) delete names[k]; replayBtn();
     strings.clear(); obsSeen.clear(); smokeSeen.clear(); for (const k of ['barn', 'me', 'map', 'obst', 'bul', 'smoke', 'net', 'loc', 'loot', 'proj', 'air', 'plane', 'gas']) K[k] = null; lootSeen.clear(); projSeen.clear(); airSeen.clear(); planeSeen.clear(); perkSeen.clear(); gasSig = ''; invSig = '';
     const m = theMap(g);
@@ -353,7 +364,7 @@
     if (md && Array.isArray(md.objects)) push(['m', now(), md.objects.map(o => [str(o.type), r2(o.pos && o.pos.x), r2(o.pos && o.pos.y), o.ori | 0, r2(o.scale)]), (md.places || []).map(p => [str(p.name), r2(p.pos && p.pos.x), r2(p.pos && p.pos.y)]), terrain]);
     hookKills(g);
   }
-  function matchEnd(why) { if (!inMatch) return; inMatch = false; const t = now(); push(['E', t, why, 0, 0, null]); gameNote(t); flush(); }
+  function matchEnd(why) { if (!inMatch) return; clipEnd(); inMatch = false; const t = now(); push(['E', t, why, 0, 0, null]); gameNote(t); flush(); }
 
   // the kill feed: the server sends every kill to every client; the game reads it and only draws it. We read the same fields
   // first and put the reading position back, so the game reads them exactly as before.
@@ -565,7 +576,7 @@
       el.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:2147483647;font:11px system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.55);padding:3px 7px;border-radius:3px;cursor:pointer;user-select:none';
       el.onclick = () => { paused = !paused; try { localStorage.setItem('observer.paused', paused ? '1' : '0'); } catch (e) {} buf = []; inMatch = false; badge(); }; // a resume starts the match notes afresh
       document.body.appendChild(el); }
-    el.textContent = 'observer ' + (paused ? 'paused (click to resume)' : (inMatch ? 'recording' : 'on') + ' · ' + (sentBytes / 1024).toFixed(0) + ' KB sent' + (lastError ? ' · ' + lastError : ''));
+    clipChip(); el.textContent = 'observer ' + (paused ? 'paused (click to resume)' : (inMatch ? 'recording' : 'on') + ' · ' + (sentBytes / 1024).toFixed(0) + ' KB sent' + (lastError ? ' · ' + lastError : ''));
   }
 
   // ---------- the death replay button ----------
@@ -580,11 +591,12 @@
     'font-size:22px;font-weight:700;letter-spacing:.3px;background:#d9512c;border-bottom:2px solid #9e3a1f;box-shadow:inset 0 -2px #9e3a1f,0 0 0 3px rgba(255,255,255,.85);' +
     'pointer-events:auto;cursor:pointer;z-index:5;text-align:center;white-space:nowrap';
   const shown = el => !!el && el.offsetParent !== null && getComputedStyle(el).visibility !== 'hidden';
-  function place(host, id, css, label) { // our button inside one of the game's button rows, made again if the game rebuilt the row
+  function place(host, id, css, label, fn, tip) { // our button inside one of the game's button rows, made again if the game rebuilt the row
     let b = document.getElementById(id); if (!host) return null;
     if (!b || b.parentNode !== host) { if (b) b.remove(); b = document.createElement('a'); b.id = id; b.className = 'btn-darken menu-option'; b.textContent = label;
-      b.title = 'watch your death again, drawn by the game itself'; b.style.cssText = css; b.onclick = e => { e.preventDefault(); e.stopPropagation(); openKillcam(); };
+      b.title = tip || 'watch your death again, drawn by the game itself'; b.style.cssText = css; b.onclick = e => { e.preventDefault(); e.stopPropagation(); (fn || openKillcam)(); };
       host.appendChild(b); }
+    if (b.textContent !== label) b.textContent = label; // the saved clips button counts them
     return b;
   }
   function replayBtn() { try { replayBtnDo(); } catch (e) {} } // it runs inside the recording step: a page that is not the game's must never cost a line
@@ -597,11 +609,11 @@
     if (spect && spect.parentNode.firstChild !== spect) spect.parentNode.insertBefore(spect, spect.parentNode.firstChild); // first in the spectate menu
     if (!rbtn) { rbtn = document.createElement('div'); rbtn.textContent = '\u25B6 Death replay'; rbtn.title = 'watch your death again, drawn by the game itself';
       rbtn.style.cssText = 'position:fixed;left:8px;bottom:34px;z-index:2147483647;font:700 16px system-ui,sans-serif;color:#fff;background:#d9512c;padding:9px 15px;border-radius:5px;cursor:pointer;user-select:none;box-shadow:0 1px 6px rgba(0,0,0,.5)';
-      rbtn.onclick = openKillcam; document.body.appendChild(rbtn); }
+      rbtn.onclick = () => openKillcam(); document.body.appendChild(rbtn); }
     rbtn.style.display = on && !shown(stats) && !shown(spect) ? '' : 'none';
   }
-  function openReplay() {
-    const lines = (rpSnap || rp).slice(), nm = Object.assign({}, names), w = window.open(REPLAY + '/replay', '_blank'); if (!w) return;
+  function openReplay(saved) { // saved: a clip's notes (part 5), else the death's
+    const lines = (saved || rpSnap || rp).slice(), nm = Object.assign({}, names), w = window.open(REPLAY + '/replay', '_blank'); if (!w) return;
     const onMsg = ev => { if (ev.origin !== REPLAY || ev.source !== w || !ev.data || ev.data.observerReplayReady !== 1) return; window.removeEventListener('message', onMsg);
       w.postMessage({ observerReplay: 1, lines, names: nm, player: myId }, REPLAY); };
     window.addEventListener('message', onMsg); setTimeout(() => window.removeEventListener('message', onMsg), 30000);
@@ -612,11 +624,12 @@
   const kcSnap = new Map();
   const wireCut = () => { const w = wire; if (!w || !w.frames.length) return null; return { url: w.url, openEpoch: w.openEpoch, t0: w.t0, frames: w.frames.slice(), death: diedAt, me: myId }; };
   window.addEventListener('message', ev => { const d = ev.data, s = kcSnap.get(ev.source); if (ev.origin !== location.origin || !s || !d || d.vbKillcamReady !== 1) return;
-    const frames = s.frames.map(f => [f[0] - s.t0, f[1].slice(0)]), death = s.death - s.t0;
-    ev.source.postMessage({ vbKillcam: 1, url: s.url, openEpoch: s.openEpoch, frames, death, from: death - KC_BEFORE, to: death + KC_AFTER, me: s.me }, location.origin, frames.map(f => f[1])); });
-  function openKillcam() {
-    const s = wireSnap || (died ? wireCut() : null);
-    if (!s || !s.frames.length || !s.death) { openReplay(); return; } // no copy of this match's socket (the observer started after it opened): the map replay
+    // a saved clip (part 5): death is its first key press, the window the 20 s before it to the clip's end
+    const frames = s.frames.map(f => [f[0] - s.t0, f[1].slice(0)]), death = s.death - s.t0, clip = s.clip | 0;
+    ev.source.postMessage({ vbKillcam: 1, url: s.url, openEpoch: s.openEpoch, frames, death, clip, from: death - (clip ? CLIP_BEFORE : KC_BEFORE), to: clip ? s.end - s.t0 : death + KC_AFTER, me: s.me }, location.origin, frames.map(f => f[1])); });
+  function openKillcam(snap, lines) { // snap, lines: a saved clip's (part 5); none: the death's
+    const s = snap || (lines ? null : wireSnap || (died ? wireCut() : null));
+    if (!s || !s.frames.length || !s.death) { openReplay(lines); return; } // no copy of this match's socket (the observer started after it opened): the map replay
     const w = window.open(location.origin + '/?u=' + encodeURIComponent(btoa(KC_URL)) + '&jt=vb', '_blank'); if (!w) return;
     kcSnap.set(w, s); while (kcSnap.size > 3) kcSnap.delete(kcSnap.keys().next().value);
   }
@@ -624,9 +637,180 @@
   window.__observerWire = () => (wire ? { n: wire.frames.length, bytes: wire.bytes, url: wire.url, u: nU, upd: updSeq } : null); // the same test: how much of the socket is copied
   window.__observerKillcam = () => { const s = wireCut(); if (s) { s.death = Math.round(performance.now()); wireSnap = s; died = true; } openKillcam(); }; // tools/test-observer-killcam.js: the killcam without dying
 
+  // ---------- 5. saved clips (1.6.0) ----------
+  // A key the player picks (there is none until then: the menu asks once, and Settings > Keybinds has a row for it) keeps the 20 s
+  // before the press and the 10 s after it from the copy of the game's socket (part 0), to watch in the killcam tab as a death is.
+  // Another press while a clip is open moves its end to 10 s after that press (60 s in all at most). Five clips a match and ten in
+  // all are kept, in this tab only: a clip is never uploaded. One line per press is (C: the time and the clip's number), so the clip
+  // jury can find the moments players pointed at. The key is only listened for: the game gets it as before, and nothing is pressed or
+  // held back, except while the player is picking it, when the press is the picker's (as in the game's own Keybinds menu). A beep
+  // for a new clip, two for a longer one, a low tone once it is saved (silent when the game's sound is muted).
+  const CLIP_STORE = 'observer.clipkey', CLIP_NAG = 'observer.clipnag';
+  let clipBind = null; try { const b = JSON.parse(localStorage.getItem(CLIP_STORE) || 'null'); if (b && (b.t === 'k' || b.t === 'm') && Number.isInteger(b.c) && typeof b.n === 'string') clipBind = b; } catch (e) {}
+  // clips: the saved ones, oldest first; clipOpen: the one still taking its 10 s after; clipPick: the picker waiting for a key
+  // ({from: 'bar' | 'panel' | a Keybinds row}); clipSaid: what the picker says ({text, warn, until, from})
+  let clips = [], clipOpen = null, clipN = 0, clipPick = null, clipSaid = null;
+  const keyName = e => { const c = e.keyCode | 0; return (c >= 65 && c <= 90) || (c >= 48 && c <= 57) ? String.fromCharCode(c) : e.key === ' ' ? 'Space' : typeof e.key === 'string' && e.key.length === 1 ? e.key.toUpperCase() : String(e.key || e.code || 'Key ' + c); }; // letters and digits as the game names them (input.ts KeyNames)
+  const MOUSE = { 3: 'Thumb Mouse 1', 4: 'Thumb Mouse 2' }; // the side buttons, as the game names them (input.ts MouseButtonNames); the game already keeps them from going back or on a page
+  const NO_KEY = [17, 18, 91, 92, 93, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123]; // Ctrl, Alt, the system keys and F1-F12, refused as in the game's own Keybinds menu (its disallowKeys)
+  const typingIn = e => { const t = e.target, n = t && t.tagName; return n === 'INPUT' || n === 'TEXTAREA' || n === 'SELECT' || !!(t && t.isContentEditable); };
+  const nagOff = () => { try { return localStorage.getItem(CLIP_NAG) === '1'; } catch (e) { return false; } };
+  function clipInput(e) {
+    try {
+      const key = e.type === 'keydown';
+      if (clipPick) {
+        if (!key && !MOUSE[e.button]) return; // a click (on the picker's own buttons, or anywhere) goes on as usual
+        e.preventDefault(); e.stopPropagation(); if (key && e.repeat) return;
+        if (key && e.keyCode === 27) { clipPickEnd(undefined); return; } // Esc: cancel
+        if (key && e.keyCode === 8) { clipPickEnd(null); return; } // Backspace: no key
+        if (key && NO_KEY.includes(e.keyCode)) return;
+        clipPickEnd(key ? { t: 'k', c: e.keyCode | 0, n: keyName(e) } : { t: 'm', c: e.button, n: MOUSE[e.button] }); return;
+      }
+      if (!clipBind || (key && (e.repeat || typingIn(e)))) return;
+      if (typeof document.querySelector === 'function' && document.querySelector('.btn-keybind-desc-selected')) return; // the game's own Keybinds menu is waiting for a key: that press is its
+      if (key ? clipBind.t === 'k' && (e.keyCode | 0) === clipBind.c : clipBind.t === 'm' && e.button === clipBind.c) clipPress();
+    } catch (err) {}
+  }
+  window.addEventListener('keydown', clipInput, true); window.addEventListener('mousedown', clipInput, true);
+
+  // the picker: from the menu's bar, a Keybinds row or the clips panel. The end: a key, null (Backspace: no key) or undefined (Esc)
+  function clipPickStart(from) { clipPick = { from }; clipSaid = { text: 'Press a key or a mouse side button for clips (Esc: cancel, Backspace: no key)', warn: false, until: 0, from }; try { clipUi(); } catch (e) {} }
+  function clipPickEnd(b) {
+    const from = clipPick && clipPick.from; clipPick = null; if (b === undefined) { clipSaid = null; if (toastEl) toastEl.style.display = 'none'; try { clipUi(); } catch (e) {} return; }
+    clipBind = b; try { if (b) localStorage.setItem(CLIP_STORE, JSON.stringify(b)); else localStorage.removeItem(CLIP_STORE); } catch (e) {}
+    let clash = ''; try { clash = b ? gameBindOf(b.n) : ''; } catch (e) {}
+    clipSaid = { text: b ? 'Clip key: ' + b.n + (clash ? '. It is also "' + clash + '" in your game, so both will happen' : '. Press it in a match to keep the last 20 s and the next 10 s') : 'No clip key', warn: !!clash, until: Date.now() + (clash ? 9000 : 5000), from };
+    if (from !== 'bar') clipToast(clipSaid.text, clash ? 9000 : 5000, clash);
+    try { clipUi(); } catch (e) {}
+  }
+  // which of the game's actions a key is bound to, read from its own Keybinds list (each row: a description, then the key)
+  function gameBindOf(name) {
+    for (const row of document.querySelectorAll('.js-keybind-list .ui-keybind-container')) { if (row.classList.contains('observer-clip-row')) continue;
+      const d = row.querySelector('.btn-keybind-desc'), v = row.querySelector('.btn-keybind-display'); if (d && v && v.textContent.trim() === name) return d.textContent.trim(); }
+    return '';
+  }
+
+  function clipPress() {
+    const t = now(); if (clipOpen && t >= clipOpen.end) clipClose(clipOpen); // ended, not yet put away (the tick runs every 250 ms): a new clip
+    if (clipOpen) { const end = Math.min(clipOpen.at - CLIP_BEFORE + CLIP_LONG, t + CLIP_AFTER); clipOpen.end = Math.max(clipOpen.end, end); clipOpen.presses++;
+      if (inMatch && !paused) push(['C', t, clipOpen.n]); beep(2); clipToast(end < t + CLIP_AFTER ? 'Clip at its 60 s limit' : 'Clip longer: 10 s from now', 1500); return; }
+    if (!inMatch) { clipToast('Clips are saved during a match', 2000); return; }
+    clipOpen = { n: ++clipN, match, at: t, end: t + CLIP_AFTER, w: wire, me: myId, wall: Date.now(), presses: 1 };
+    if (!paused) push(['C', t, clipOpen.n]); beep(1); clipToast('Saving clip... 10 s', 1500);
+  }
+  // the clip's copy of the socket is taken when it ends (references to the messages already kept, nothing copied), with the match's notes
+  // for the map replay when there is no copy (the observer started after the match did)
+  function clipClose(c) {
+    if (clipOpen === c) clipOpen = null; const w = c.w, t = now(); c.w = null;
+    c.snap = w && w.frames.length ? { url: w.url, openEpoch: w.openEpoch, t0: w.t0, frames: w.frames.slice(), death: c.at, end: Math.min(c.end, t), clip: c.n, me: c.me } : null;
+    c.lines = c.match === match ? rp.slice() : []; c.len = Math.max(1, Math.round((Math.min(c.end, t) - (c.at - CLIP_BEFORE)) / 1000));
+    clips.push(c); let drop = '';
+    const same = clips.filter(x => x.match === c.match); if (same.length > CLIP_MATCH) { clips.splice(clips.indexOf(same[0]), 1); drop = ' (the oldest of this match let go: 5 a match)'; }
+    if (clips.length > CLIP_ALL) { clips.splice(0, clips.length - CLIP_ALL); drop = drop || ' (the oldest let go: 10 are kept)'; }
+    beep(3); clipToast('Clip saved: ' + clips.length + ' to watch (bottom left, or after the match)' + drop, 3500); try { badge(); } catch (e) {}
+  }
+  function clipEnd() { if (clipOpen) clipClose(clipOpen); }
+  function clipTick() {
+    try { if (clipOpen && now() >= clipOpen.end) clipClose(clipOpen); else if (clipOpen) clipToast('Saving clip... ' + Math.max(1, Math.ceil((clipOpen.end - now()) / 1000)) + ' s', 400); } catch (e) {}
+    try { if (clipPick && clipPick.from !== 'bar' && clipSaid) clipToast(clipSaid.text, 400); else if (toastEl && Date.now() > toastUntil) toastEl.style.display = 'none'; } catch (e) {}
+  }
+
+  // the toast: one line at the top of the screen that clicks go through
+  let toastEl = null, toastUntil = 0;
+  function clipToast(text, ms, warn) {
+    if (!document.body) return;
+    if (!toastEl) { toastEl = document.createElement('div'); toastEl.style.cssText = 'position:fixed;left:50%;top:130px;transform:translateX(-50%);z-index:2147483647;pointer-events:none;font:700 15px system-ui,sans-serif;color:#fff;background:rgba(0,0,0,.72);border-left:4px solid #d9512c;padding:6px 12px;border-radius:4px;max-width:calc(100vw - 32px)'; document.body.appendChild(toastEl); }
+    toastEl.textContent = text; toastEl.style.borderLeftColor = warn ? '#f5b041' : '#d9512c'; toastEl.style.display = ''; toastUntil = Date.now() + (ms || 1500);
+  }
+  // the sounds, made here (no files): 880 Hz for a new clip, two short 1047 Hz for a longer one, a low 523 Hz once saved
+  let actx = null;
+  function beep(kind) {
+    try {
+      const am = app && app.audioManager; if (am && am.mute) return;
+      if (!actx) { const A = window.AudioContext || window.webkitAudioContext; if (!A) return; actx = new A(); } if (actx.state === 'suspended') actx.resume();
+      const tone = (f, at, d, v) => { const o = actx.createOscillator(), g = actx.createGain(), t0 = actx.currentTime + at; o.type = 'sine'; o.frequency.value = f; g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(v, t0 + 0.012); g.gain.exponentialRampToValueAtTime(0.0001, t0 + d); o.connect(g); g.connect(actx.destination); o.start(t0); o.stop(t0 + d + 0.03); };
+      if (kind === 1) tone(880, 0, 0.13, 0.09); else if (kind === 2) { tone(1047, 0, 0.07, 0.09); tone(1047, 0.11, 0.07, 0.09); } else tone(523, 0, 0.25, 0.07);
+    } catch (e) {}
+  }
+
+  // the page: a row in each of the game's Keybinds lists, the menu's bar, the results panel's button; made again whenever the game
+  // rebuilds what they sit in
+  function clipUi() {
+    if (!document.body || typeof document.querySelectorAll !== 'function') return;
+    for (const list of document.querySelectorAll('.js-keybind-list')) {
+      let row = list.querySelector('.observer-clip-row');
+      if (!row) { row = document.createElement('div'); row.className = 'ui-keybind-container observer-clip-row';
+        const d = document.createElement('a'); d.className = 'btn-game-menu btn-darken btn-keybind-desc'; d.textContent = 'Save clip (observer)'; d.title = 'survev observer: keeps the last 20 s and the next 10 s to watch again; Esc cancels, Backspace sets no key';
+        d.onclick = e => { e.preventDefault(); e.stopPropagation(); if (clipPick && clipPick.from === d) clipPickEnd(undefined); else clipPickStart(d); };
+        const v = document.createElement('div'); v.className = 'btn-keybind-display'; row.appendChild(d); row.appendChild(v); list.appendChild(row); }
+      const d = row.querySelector('.btn-keybind-desc'), v = row.querySelector('.btn-keybind-display'), on = !!clipPick && clipPick.from === d, tx = clipBind ? clipBind.n : '';
+      if (d.classList.contains('btn-keybind-desc-selected') !== on) d.classList.toggle('btn-keybind-desc-selected', on);
+      if (v.textContent !== tx) v.textContent = tx;
+    }
+    menuBar(); clipBtn();
+  }
+  // the menu's bar: until a key is picked (or Not now), where every player looks before a match
+  let mbar = null;
+  function menuBar() {
+    const menu = document.getElementById('start-menu'), onMenu = !inMatch && shown(menu), mine = clipPick && clipPick.from === 'bar', said = clipSaid && clipSaid.from === 'bar' && Date.now() < clipSaid.until;
+    const want = onMenu && (mine || said || (!clipBind && !clipPick && !nagOff()));
+    if (!want) { if (mbar) mbar.style.display = 'none'; return; }
+    if (!mbar) { mbar = document.createElement('div'); mbar.id = 'observer-clip-bar';
+      mbar.style.cssText = 'position:fixed;left:50%;top:10px;transform:translateX(-50%);z-index:2147483647;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:8px 10px;max-width:calc(100vw - 32px);box-sizing:border-box;background:#d9512c;color:#fff;font:600 15px system-ui,sans-serif;padding:8px 12px;border-radius:6px;box-shadow:0 2px 10px rgba(0,0,0,.45)';
+      const b = (t, f) => { const x = document.createElement('button'); x.textContent = t; x.style.cssText = 'font:700 14px system-ui,sans-serif;color:#d9512c;background:#fff;border:0;border-radius:4px;padding:5px 12px;cursor:pointer'; x.onclick = e => { e.preventDefault(); e.stopPropagation(); x.blur(); f(); }; return x; };
+      mbar.txt = document.createElement('span'); mbar.set = b('Set key', () => clipPickStart('bar')); mbar.later = b('Not now', () => { try { localStorage.setItem(CLIP_NAG, '1'); } catch (e) {} menuBar(); }); mbar.cancel = b('Cancel', () => clipPickEnd(undefined));
+      mbar.later.style.background = 'transparent'; mbar.later.style.color = '#fff'; mbar.later.style.border = '1px solid rgba(255,255,255,.7)';
+      for (const x of [mbar.txt, mbar.set, mbar.later, mbar.cancel]) mbar.appendChild(x); document.body.appendChild(mbar); }
+    mbar.style.display = 'flex'; mbar.style.background = said && clipSaid.warn ? '#9a5b00' : '#d9512c';
+    const tx = mine || said ? clipSaid.text : 'survev observer: pick a key that saves a clip (the last 20 s and the next 10 s) when you see a cheater. You can change it in Settings > Keybinds';
+    if (mbar.txt.textContent !== tx) mbar.txt.textContent = tx;
+    mbar.set.style.display = !mine && !said ? '' : 'none'; mbar.later.style.display = !mine && !said ? '' : 'none'; mbar.cancel.style.display = mine ? '' : 'none';
+  }
+  // the results panel: Saved clips under the Death replay button (or in its place after a win)
+  const CLIPS_CSS = 'display:block;position:absolute;left:50%;transform:translateX(-50%);width:330px;height:44px;line-height:44px;padding:0;font-size:18px;font-weight:700;background:#2f6fd0;border-bottom:2px solid #1f4d94;' +
+    'box-shadow:inset 0 -2px #1f4d94,0 0 0 2px rgba(255,255,255,.7);pointer-events:auto;cursor:pointer;z-index:5;text-align:center;white-space:nowrap';
+  function clipBtn() {
+    const host = document.getElementById('ui-stats-options'), old = document.getElementById('observer-clips-stats');
+    if (!clips.length || !host) { if (old) old.remove(); return; }
+    const b = place(host, 'observer-clips-stats', CLIPS_CSS, '▶  SAVED CLIPS (' + clips.length + ')', clipList, 'watch the clips you saved with your clip key'); if (!b) return;
+    const dr = document.getElementById('observer-replay-stats'), top = (dr && shown(dr) ? 126 : 64) + 'px'; if (b.style.top !== top) b.style.top = top;
+  }
+  // the badge's second half: how many clips, a click opens the list
+  let chip = null;
+  function clipChip() {
+    if (!document.body || !el) return;
+    if (!chip) { chip = document.createElement('div'); chip.title = 'your saved clips: click to watch them';
+      chip.style.cssText = 'position:fixed;bottom:8px;z-index:2147483647;font:700 11px system-ui,sans-serif;color:#fff;background:#d9512c;padding:3px 7px;border-radius:3px;cursor:pointer;user-select:none';
+      chip.onclick = e => { if (e) e.stopPropagation(); clipList(); }; document.body.appendChild(chip); }
+    chip.style.display = clips.length ? '' : 'none'; chip.style.left = (8 + (el.offsetWidth || 170) + 6) + 'px';
+    chip.textContent = '▶ ' + clips.length + ' clip' + (clips.length === 1 ? '' : 's');
+  }
+  // the list: newest first, each opens in the killcam tab; the clip key and a way to change it
+  let panel = null;
+  function clipList() {
+    if (!document.body) return; if (panel) { panel.remove(); panel = null; return; }
+    const p = panel = document.createElement('div'); p.id = 'observer-clips';
+    p.style.cssText = 'position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;width:340px;max-width:calc(100vw - 32px);box-sizing:border-box;background:rgba(13,17,23,.95);color:#fff;font:600 14px system-ui,sans-serif;padding:14px 16px;border-radius:8px;box-shadow:0 2px 14px rgba(0,0,0,.6)';
+    const line = (css) => { const d = document.createElement('div'); d.style.cssText = css || 'display:flex;align-items:center;justify-content:space-between;gap:10px;margin:6px 0'; p.appendChild(d); return d; };
+    const b = (box, t, f, main) => { const x = document.createElement('button'); x.textContent = t; x.style.cssText = 'font:700 13px system-ui,sans-serif;color:#fff;background:' + (main ? '#d9512c' : '#3a3f47') + ';border:0;border-radius:4px;padding:5px 11px;cursor:pointer;white-space:nowrap'; x.onclick = e => { e.preventDefault(); e.stopPropagation(); x.blur(); f(); }; box.appendChild(x); return x; };
+    line('font:700 16px system-ui,sans-serif;margin-bottom:8px').textContent = 'Saved clips';
+    if (!clips.length) line('color:#bbb;font-weight:500').textContent = clipBind ? 'None yet. Press ' + clipBind.n + ' in a match to keep the last 20 s and the next 10 s.' : 'None yet. Pick a clip key below, then press it in a match.';
+    const ago = w => { const m = Math.round((Date.now() - w) / 60000); return m < 1 ? 'just now' : m + ' min ago'; };
+    for (const c of clips.slice().reverse()) { const r = line(), tx = document.createElement('span'); tx.textContent = 'Clip ' + c.n + ' · ' + c.len + ' s · ' + ago(c.wall); r.appendChild(tx);
+      b(r, '▶ Watch', () => { clipList(); openKillcam(c.snap, c.lines); }, true); }
+    const k = line('display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;padding-top:10px;border-top:1px solid #333;color:#ccc;font-weight:500'), kt = document.createElement('span');
+    kt.textContent = 'Clip key: ' + (clipBind ? clipBind.n : 'none'); k.appendChild(kt); b(k, 'Change key', () => { clipList(); clipPickStart('panel'); });
+    b(line('display:flex;justify-content:flex-end;margin-top:8px'), 'Close', () => clipList());
+    document.body.appendChild(p);
+  }
+  // tools/test-observer.js and tools/test-observer-clip.js: the clips as they stand, and one of them opened
+  window.__observerClips = () => ({ inMatch, bind: clipBind, open: clipOpen ? { n: clipOpen.n, at: clipOpen.at, end: clipOpen.end, presses: clipOpen.presses } : null, clips: clips.map(c => ({ n: c.n, match: c.match, at: c.at, end: c.end, len: c.len, frames: c.snap ? c.snap.frames.length : 0, lines: c.lines.length })) });
+  window.__observerClipWatch = i => { const c = clips[i]; if (c) openKillcam(c.snap, c.lines); };
+
   function loop() { try { tick(); } catch (e) {} requestAnimationFrame(loop); }
   requestAnimationFrame(loop);
   setInterval(() => { flush(); badge(); gameIds(); }, FLUSH_MS);
   setInterval(badge, 2000);
-  setInterval(() => { try { replayBtn(); } catch (e) {} }, 400); // the game rebuilds its results panel each time it shows it
+  setInterval(() => { try { replayBtn(); } catch (e) {} try { clipUi(); } catch (e) {} }, 400); // the game rebuilds its results panel and its Keybinds lists each time it shows them
+  setInterval(clipTick, 250);
 })();

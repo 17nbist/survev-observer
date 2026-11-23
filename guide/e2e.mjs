@@ -1,6 +1,6 @@
 // Runs GUIDE.md end to end in headless Chromium and retakes its screenshots.
 //   npm i playwright && npx playwright install chromium
-//   node guide/e2e.mjs                 every step; exit 0 only if the observer badge shows on survev.io
+//   node guide/e2e.mjs                 every step; exit 0 only if the observer badge and the clip key bar show on survev.io
 //   node guide/e2e.mjs --skip-toggle   control: leaves Allow User Scripts off; must FAIL (script installed, never runs)
 //   node guide/e2e.mjs --show          with a window (CHROME=/path/to/chromium to use another build)
 // It stops at the survev.io menu and never joins a match, so the observer uploads nothing.
@@ -85,6 +85,15 @@ try {
   await game.waitForTimeout(3000);
   await shot(game, '4-menu');
   await shot(game, '4-badge', { x: 0, y: 640, width: 420, height: 160 });
+
+  // Step 5 (from 1.6.0): the menu's bar asks for a clip key; Set key, then K, keeps it.
+  const bar = game.locator('#observer-clip-bar');
+  try {
+    await bar.waitFor({ state: 'visible', timeout: 10000 }); await shot(game, '5-clip-bar', { x: 0, y: 0, width: 1280, height: 140 });
+    await bar.locator('button', { hasText: 'Set key' }).click(); await game.keyboard.press('k'); await game.waitForTimeout(300);
+    const kept = await game.evaluate(() => localStorage.getItem('observer.clipkey'));
+    if (kept && JSON.parse(kept).n === 'K') step(5, 'clip key K kept: "' + (await bar.innerText()).trim().slice(0, 60) + '"'); else fail('the clip key was not kept (' + kept + ')');
+  } catch (e) { fail('no clip key bar on the menu (' + e.message.split('\n')[0] + ')'); }
 } catch (e) { fail(e.message); }
 finally { await ctx.close(); }
 if (SKIP) { console.log(process.exitCode ? 'CONTROL OK: without Allow User Scripts the observer does not run' : 'CONTROL WRONG: the observer ran without Allow User Scripts'); process.exitCode = process.exitCode ? 0 : 1; }

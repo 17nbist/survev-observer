@@ -40,6 +40,15 @@ Open [survev.io](https://survev.io/) (reload it if it was already open). In the 
 
 That's it. Play as normal. The number goes up as it sends your matches. Click the label to pause it.
 
+## 5. Pick a clip key (optional)
+
+The first time, the menu shows an orange bar. Click **Set key** and press the key (or mouse side button) you want. In a match,
+press it when you see something odd: it keeps the last 20 seconds and the next 10. Watch your clips from **▶ N clips** next to the
+label, or from the results screen. Change the key later in survev's **Settings > Keybinds** (**Save clip (observer)**), or click
+**Not now** if you do not want one.
+
+![the clip key bar on the menu](img/5-clip-bar.png)
+
 ## If the label does not show
 
 - Go back to step 2: **Allow User Scripts** being off is the usual cause.
@@ -56,6 +65,6 @@ That's it. Play as normal. The number goes up as it sends your matches. Click th
 
 ---
 
-*This guide is checked by a script: [e2e.mjs](e2e.mjs) runs steps 1 to 4 in a headless Chrome, takes these screenshots,
+*This guide is checked by a script: [e2e.mjs](e2e.mjs) runs steps 1 to 5 in a headless Chrome, takes these screenshots,
 and fails if the label does not show. It stops at the menu and never joins a match. Its control run (`--skip-toggle`)
 checks that step 2 is really needed. The Firefox and Edge notes are not covered by it.*
