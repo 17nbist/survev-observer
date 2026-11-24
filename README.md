@@ -1,7 +1,9 @@
 # survev observer
 
 A Tampermonkey script that records what your survev.io game already shows you while you play, and sends it to the
-[clip jury](https://clip-jury.pages.dev/), a side project that looks for players whose aim looks inhuman.
+[clip jury](https://clip-jury.pages.dev/), a side project that looks for players whose aim looks inhuman. From 1.8.0 it also sends a
+copy of what the game's server sent your game, so a moment you flag can be shown on the jury in the game's own client (see **The
+match copy** below).
 
 It only reads. No aim help, no wallhack, no automation: nothing in your game changes.
 
@@ -20,6 +22,8 @@ When you die, a "Death replay" button appears (under Play Again, at the top of t
 survev.io in a new tab and plays your last 20 seconds back through the game's own client: your screen exactly as you saw it, your
 HUD, the doors, the kill feed, drawn by the game itself.
 
+From 1.8.0 the first open no longer says "failed joining game": the new tab opens at `survev.io/?vbkc=1`, which joins nothing, and the script starts the replay itself once it is running (it reloads that tab once by itself if the userscript manager came in late). 1.8.0 also keeps each uploaded chunk of the match copy exactly as first built until it is taken, and uploads the last one when the game closes or you die, so nothing is lost on a bad connection or a closed tab.
+
 The replay plays as soon as it opens. The bar at the top:
 
 - pause and play, 5 s back or on, back to the start, and a slider to go anywhere in the 20 s; going back
@@ -31,9 +35,9 @@ The replay plays as soon as it opens. The bar at the top:
   for a 20 s replay), with its HUD and its sound, then puts the replay back where you were. The file is sized to stay under
   Discord's 10 MB. A browser that cannot do that (no WebCodecs) records the replay in real time instead; the button then says so.
 
-How: the script keeps a copy of what the server sends your game (about 3 KB a second, in that tab only, never uploaded). The replay
-tab's game plays that copy instead of joining a server, so it sends nothing anywhere. Player names are in the copy, since the
-server sends them to everyone; they stay in your browser.
+How: the script keeps a copy of what the server sends your game (about 3 KB a second). The replay tab's game plays that copy
+instead of joining a server, so it sends nothing anywhere. Player names are in the copy, since the server sends them to everyone.
+From 1.8.0 the copy is also uploaded (see **The match copy** below); the replay itself is still played from your browser's own copy.
 
 The idea comes from [Surviv.io input replay recorder](https://greasyfork.org/scripts/447501) by garlic, samer kizi and preacher
 (MIT), which records the game's socket the same way.
@@ -55,17 +59,19 @@ the clip goes on to 10 seconds after that press (two beeps), up to 60 seconds in
 - 5 clips a match and the 10 newest in all are kept, in that tab only. Close the tab and they are gone; save a video to keep one.
 
 The script only listens for that one key: your game gets it as before, and the script never presses, holds or changes any input.
-The clip itself is never uploaded. What is sent is one small line per press, with the time and the clip's number (see below), so
-the clip jury can look first at the moments players pointed at.
+The clip itself (the tab's copy) is not sent as a clip. What is sent is one small line per press, with the time and the clip's number
+(see below), so the clip jury can look first at the moments players pointed at; the match copy (see below) is what lets the jury
+show that moment in the game's own client.
 
-It is one file of about 950 lines. Read it before you install it. From 1.7.0 it also loads one library, mp4-muxer 5.2.2 (MIT, the
+It is one file of about 1000 lines. Read it before you install it. From 1.7.0 it also loads one library, mp4-muxer 5.2.2 (MIT, the
 part that packs the Download into an MP4 file): Tampermonkey fetches it from cdn.jsdelivr.net when you install or update the script,
 at that exact version, never while you play. It is loaded with the script but used only when you press Download. If it cannot load,
 Download records in real time instead.
 
 ## What it sends
 
-Every 10 seconds, zipped, to `https://survev-observer.pages.dev/api/upload`:
+Zipped, to `https://survev-observer.pages.dev/api/upload`, every 10 seconds but never while you are alive in a match (from 1.8.1):
+what a match noted goes once you die or the match ends, so the upload never competes with your game. It is:
 
 - the map and its buildings (once a match)
 - every game update: position, facing, weapon and gear of you and of the players on your screen; for you (or the player you watch after you die) also the scope and how far it lets you see
@@ -75,10 +81,32 @@ Every 10 seconds, zipped, to `https://survev-observer.pages.dev/api/upload`:
 - when you press your clip key (from 1.6.0): the time of the press and the clip's number, nothing else
 
 - only if you are signed in to a survev.io account: the game's id (see below)
+- from 1.8.0, separately, to `https://survev-observer.pages.dev/api/wire`: the match copy (next section)
 
-Players are the game's own numbers, never names. Nothing else about you leaves your browser beyond what is in the game: no account
+In these notes players are the game's own numbers, never names. Nothing else about you leaves your browser beyond what is in the game: no account
 name, no cookies, no browser details. The upload server keeps a random id for your browser (so one batch can be matched to the
 next) and a scrambled, daily-changing version of your IP address, only to stop spam. Your IP address itself is not stored.
+
+## The match copy (from 1.8.0)
+
+So that a clip of a moment can be shown on the clip jury in the game's own, unmodified client (a video of the game playing back
+exactly what your game was sent), the script uploads a copy of what the server sent your game during the match, the same copy the
+death replay plays:
+
+- **What it is**: the messages the game's server sends to your game, exactly as they arrived, with their times. About 3 KB a second,
+  about 10 MB an hour, zipped, in chunks every 10 seconds once you are dead or the match is over (from 1.8.1), and when the game's socket closes, to
+  `https://survev-observer.pages.dev/api/wire`. The first chunk of a match also says when the socket opened, the game server's host
+  and port, the game's version (the `gitRevision` the page's own `site_info` answer reports, read as the page gets it) and the
+  script's version.
+- **What is not in it**: nothing you send. Your keys, mouse, chat, account, cookies and browser details are not in it, only what the
+  server sends down.
+- **Names are in it**: the server sends every player's name to every player, so the copy holds the names of the players of your game
+  as the game shows them, yours included. (The track notes above still never carry names.)
+- **Where it goes**: only to the observer's server, stored privately, deleted from the server once the clip jury has pulled it (anything
+  older than 7 days is dropped in any case). It is never published as it is; what the jury shows is a video of a moment, not the file.
+- **Pause**: clicking the label pauses it; nothing is uploaded while paused, and a match that was paused is not picked up again.
+- If a chunk cannot be sent for good, the rest of that match's copy is not sent either (a gap makes the later chunks unreadable);
+  your game is not affected.
 
 ## The game id (signed-in players only, from 1.3.5)
 
@@ -106,13 +134,15 @@ name. If you do not want that, sign out of survev.io or pause the script (click 
 
 1. It waits for the game to start and keeps a reference to it. The game's main object passes through `Function.prototype.call` once while it loads; the script spots it there and puts `Function.prototype.call` back.
 2. The game renames its fields when it is built, so the script finds what it needs by shape (a list of players, an object with four position fields, and so on) and remembers the names.
-3. On each world update from the server, it writes one line of numbers. Every 10 seconds it zips the lines and sends them.
-4. It keeps a copy of the game socket's messages for the killcam (part 0 of the file); it never sends that copy.
+3. On each world update from the server, it writes one line of numbers. Once you die or the match ends it zips the lines and sends them, in batches 10 seconds apart (1.8.1; before, every 10 seconds while you played).
+4. It keeps a copy of the game socket's messages for the killcam (part 0 of the file), and sends it to the observer's server in
+   chunks (part 3b), so a clip can be shown in the game's own client on the clip jury. It also reads the page's own
+   `/api/site_info` answer for the game's version (a copy of the response; the page's request is unchanged).
 5. Your clip key (part 5) cuts a clip out of that same copy; it listens for that key only, and holds a press back only while you
    are picking the key.
 
-`server/` is the upload endpoint (Cloudflare Pages Functions and a D1 table). Batches stay there until they are pulled into the
-clip jury's data, then they are deleted.
+`server/` is the upload endpoint (Cloudflare Pages Functions and a D1 database): `/api/upload` for the notes and `/api/wire` for the
+match copy. Batches and chunks stay there until they are pulled into the clip jury's data, then they are deleted.
 
 ## License
 

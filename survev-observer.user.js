@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         survev observer
 // @namespace    https://github.com/17nbist/survev-observer
-// @version      1.7.0
+// @version      1.8.1
 // @description  Records what your survev.io game already shows you (where players are, where they aim, their shots) and sends it to the clip jury to help catch cheaters, replays your death through the game itself, and saves a clip of the last 20 seconds on a key you pick. It changes nothing in your game.
 // @match        https://survev.io/*
 // @run-at       document-start
@@ -15,9 +15,13 @@
 //  1. Waits for the game to start, and keeps a reference to it (it does not change it).
 //  2. Every time the game gets a world update from the server, it notes where every player your client can see is, where
 //     they face, what they hold and wear, and the bullets in the air. Once a match it notes the map's shape (coast, rivers). Players are numbers only (the game's own ids), never names.
-//  3. Every 10 seconds it zips those notes and sends them to https://survev-observer.pages.dev/api/upload.
-//  4. It keeps a copy of what the server sends your game during the match (the game's socket, about 3 KB a second), in this tab
-//     only: it is never uploaded. When you die, a "Death replay" button opens survev.io in a new tab, where the game's own client
+//  3. It zips those notes and sends them to https://survev-observer.pages.dev/api/upload, every 10 seconds but never while you are
+//     alive in a match (1.8.1): what a match noted goes once you die, or when the match ends, so the upload never competes with your game.
+//  4. It keeps a copy of what the server sends your game during the match (the game's socket, about 3 KB a second), and (from 1.8.0)
+//     uploads it too, in chunks, to https://survev-observer.pages.dev/api/wire, so that a clip of a moment you flag can be shown on the
+//     clip jury in the game's own client (part 3b below). It is what the server sends to every player, so the players' names are in it as
+//     the game shows them; nothing you send is in it. It is kept privately, deleted from the server once pulled, never published as it is.
+//     When you die, a "Death replay" button opens survev.io in a new tab, where the game's own client
 //     plays that copy back: your death drawn by the game itself, exactly as you saw it (the killcam, part 0 below). Without a copy
 //     (the observer started after the match did) the button opens the clip jury's map replay instead, handing it this match's notes
 //     and the players' names directly: they go to that page in your browser and nowhere else; they are never in what is uploaded.
@@ -26,7 +30,7 @@
 //     name is used for that one question to survev.io and is never sent to us; but the game id points at the game's public stats page,
 //     where every player's name is, yours too. Not signed in: this step never runs.
 //  6. A clip key (1.6.0, none until you pick one on the menu or in Settings > Keybinds): pressing it keeps the 20 s before and the
-//     10 s after from that same copy, in this tab, to watch like a death replay (part 5 below). The clip is never uploaded; one small
+//     10 s after from that same copy, in this tab, to watch like a death replay (part 5 below). The clip itself is not uploaded (the match copy is, part 4 above); one small
 //     line is (C: when you pressed it), so the clip jury can look at the moments players point at. The key is only listened for: the
 //     game still gets it as before.
 // It sends nothing else about you beyond what is in the game (no name, no account, no browser data). The badge in the bottom left
@@ -36,18 +40,20 @@
   'use strict';
   const ENDPOINT = window.__OBSERVER_ENDPOINT || 'https://survev-observer.pages.dev/api/upload';
   const REPLAY = 'https://clip-jury.pages.dev', REPLAY_MS = 60000; // the death replay page, and how much of the match it can show
-  const VERSION = 'observer-1.7.0', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
+  const VERSION = 'observer-1.8.1', FLUSH_MS = 10000, KEEP = 60000, BATCH = 1500, MSG_KILL = 7, MSG_UPDATE = 6; // BATCH: lines in one upload at most (the server takes 600 KB)
 
   // ---------- 0. a copy of the game's socket, and the killcam ----------
   // The approach of "Surviv.io input replay recorder" (greasyfork.org/scripts/447501, MIT, by garlic, samer kizi and preacher):
   // the page's WebSocket becomes a subclass that keeps every binary message the server sends to the game's socket (/play), with
-  // its time. It changes, delays and sends nothing: the game gets each message exactly as before, and the copy never leaves this
-  // tab. The Death replay button hands it to a killcam tab (killcam() below), where the game's own client plays it back.
+  // its time. It changes, delays and sends nothing: the game gets each message exactly as before. The copy goes to the
+  // observer's server in chunks (part 3b), and the Death replay button hands it to a killcam tab (killcam() below), where the game's own client plays it back.
   const NativeWS = typeof window.WebSocket === 'function' ? window.WebSocket : null, KC_URL = 'wss://vb-killcam.invalid/play', KC_BEFORE = 20000, KC_AFTER = 2000, WIRE_MAX = 64e6;
   const CLIP_BEFORE = 20000, CLIP_AFTER = 10000, CLIP_LONG = 60000, CLIP_MATCH = 5, CLIP_ALL = 10; // a saved clip (part 5): 20 s before the press, 10 after the last one, 60 s in all at most; 5 a match, 10 kept
   // a killcam tab is known by its link alone: ?u= is the stand-in address (never a #hash, which the game reads as a team to join)
-  const KILLCAM = (() => { try { const u = new URLSearchParams(location.search).get('u'); return !!u && atob(u) === KC_URL; } catch (e) { return false; } })();
+  const KC_Q = { get: k => { try { return new URLSearchParams(location.search).get(k); } catch (e) { return null; } } }, KC_OWN = KC_Q.get('vbkc') === '1'; // 1.8.0: ?vbkc=1 (the game boots to its menu and joins nothing; the script starts the replay itself), vbr=1 once reloaded
+  const KILLCAM = KC_OWN || (() => { try { const u = KC_Q.get('u'); return !!u && atob(u) === KC_URL; } catch (e) { return false; } })(); // the old link form (u=) is still taken
   let wire = null; // the game socket of this match: {url, openEpoch, t0, frames: [[performance.now(), ArrayBuffer]], bytes}
+  const wires = []; let gitRev = null; // wires: sockets with frames not yet uploaded (part 3b); gitRev: the game server's revision, from the page's own site_info answer
   if (!KILLCAM && NativeWS) {
     try {
       class ObserverWS extends NativeWS {
@@ -55,14 +61,25 @@
           if (protocols === undefined) super(url); else super(url, protocols);
           try {
             if (/\/play(?:[?#]|$)/.test(String(url))) {
-              const rec = wire = { url: String(url), openEpoch: Date.now(), t0: performance.now(), frames: [], bytes: 0 };
-              this.addEventListener('message', e => { const d = e.data; if (d instanceof ArrayBuffer && rec.bytes < WIRE_MAX) { rec.frames.push([performance.now(), d]); rec.bytes += d.byteLength; } });
+              const rec = wire = { url: String(url), openEpoch: Date.now(), t0: performance.now(), frames: [], bytes: 0, firstEpoch: 0, sent: 0, seq: 0, match: 0, fails: 0, busy: false, dead: false, closed: false };
+              wires.push(rec);
+              this.addEventListener('message', e => { const d = e.data; if (d instanceof ArrayBuffer && rec.bytes < WIRE_MAX) { if (!rec.frames.length) rec.firstEpoch = Date.now(); rec.frames.push([performance.now(), d]); rec.bytes += d.byteLength; } });
+              this.addEventListener('close', () => { rec.closed = true; try { wireFlush(); } catch (e) {} });
             }
           } catch (e) {}
         }
       }
       window.WebSocket = ObserverWS;
     } catch (e) {}
+  }
+
+  // The game server's own revision (gitRevision) is in the page's own /api/site_info answer; it says which game code the copy above
+  // must be played with. The script reads that answer as the page gets it (a copy of the response, the page's own request unchanged).
+  if (!KILLCAM) {
+    const SITE = /\/api\/site_info(?:[?#]|$)/, rev = j => { try { if (j && typeof j.gitRevision === 'string' && /^[0-9a-f]{7,40}$/.test(j.gitRevision)) gitRev = j.gitRevision; } catch (e) {} };
+    try { const NF = window.fetch; if (typeof NF === 'function') window.fetch = function (input) { const p = Reflect.apply(NF, this, arguments); try { const u = String(input && input.url || input); if (SITE.test(u)) p.then(r => r.clone().json()).then(rev).catch(() => {}); } catch (e) {} return p; }; } catch (e) {}
+    try { const XP = typeof XMLHttpRequest === 'function' && XMLHttpRequest.prototype, xo = XP && XP.open;
+      if (xo) XP.open = function (m, u) { try { if (SITE.test(String(u))) this.addEventListener('load', () => { try { rev(JSON.parse(this.responseText)); } catch (e) {} }); } catch (e) {} return Reflect.apply(xo, this, arguments); }; } catch (e) {}
   }
 
   // ---------- 1. find the game ----------
@@ -167,11 +184,18 @@
     window.addEventListener('message', ev => { const d = ev.data; if (ev.origin !== location.origin || !window.opener || ev.source !== window.opener || !d || d.vbKillcam !== 1 || KC.data || !Array.isArray(d.frames)) return;
       const F = d.frames, first = F.length ? F[0][0] : 0, last = F.length ? F[F.length - 1][0] : 0;
       KC.first = first; KC.from = Math.min(last, Math.max(first, +d.from || first)); KC.to = Math.max(KC.from, Math.min(last, d.to == null ? last : +d.to));
-      KC.data = d; KC.want = { t: KC.from, play: true, rec: false }; begin(); }); // 1.7.0: the replay plays as soon as it is ready
+      KC.data = d; KC.want = { t: KC.from, play: true, rec: false }; joinKc(); begin(); }); // 1.7.0: the replay plays as soon as it is ready
     const ask = () => { try { if (window.opener && !KC.data) window.opener.postMessage({ vbKillcamReady: 1 }, location.origin); } catch (e) {} };
     ask(); const askT = setInterval(() => { if (KC.data) clearInterval(askT); else ask(); }, 1000); setTimeout(() => { clearInterval(askT); if (!KC.data) bar('no replay arrived: open it from the Death replay button'); }, 30000);
     const am = () => app && app.audioManager, wasMute = (() => { let m = null; return () => { if (m === null) { const a = am(); m = !!(a && a.mute); } return m; }; })();
     const mute = m => { try { const a = am(); if (a && typeof a.setMute === 'function') a.setMute(m || wasMute()); } catch (e) {} };
+    // 1.8.0: the tab was opened at /?vbkc=1, so the game sat at its menu and joined nothing (the old link made it join at boot, before a late
+    // userscript had replaced WebSocket: "failed joining game" on the first open). With the copy here and the game caught, join the stand-in
+    // address (what seek() does). The script came in after the game booted (app never caught): one reload with vbr=1, then a message.
+    function joinKc() { if (!KC_OWN || KC.joined || !KC.data || !app || KC.sock || typeof app.joinGame !== 'function') return; KC.joined = true; try { app.joinGame({ urls: [KC_URL], joinToken: 'vb' }); } catch (e) { KC.joined = false; } }
+    if (KC_OWN) { const jt = setInterval(() => { if (KC.joined) clearInterval(jt); else joinKc(); }, 100); setTimeout(() => clearInterval(jt), 120000);
+      const miss = () => { if (app) return; if (KC_Q.get('vbr') !== '1') { try { location.replace(location.pathname + '?vbkc=1&vbr=1'); } catch (e) { location.reload(); } } else bar('the replay could not start: the userscript came in after the game began. Reload this tab, or let the userscript manager run it at document-start'); };
+      if (document.readyState === 'complete') setTimeout(miss, 3000); else window.addEventListener('load', () => setTimeout(miss, 3000)); }
     function begin() { const s = KC.sock; if (!s || !KC.data || s.kcGo) return; s.kcGo = 1; const w = KC.want; run(w.t, w.play, w.rec); }
     const giveTo = ab => { const s = KC.sock; if (s && s.readyState === 1 && s.onmessage) try { s.onmessage({ data: ab, type: 'message' }); } catch (e) {} };
     // play the copy up to t (at once, then 4x for its last 3 s), then wait there, or play on (play), or record from there (rec)
@@ -543,10 +567,10 @@
     const lu = g.lastUpdateTime; if (typeof lu !== 'number' || (onMsgOn ? updSeq === doneSeq : lu === lastUpdate)) return; doneSeq = updSeq;
     const gap = lastUpdate ? lu - lastUpdate : 0; lastUpdate = lu; const t = now(); hookFx(g);
     if (me.__id !== watching && (me.__id !== myId || watching)) { watching = me.__id === myId ? 0 : me.__id; push(['S', t, watching]); }
-    if (watching && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; diedAt = t; replayBtn(); } // the game shows someone else once you are dead
+    if (watching && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; diedAt = t; replayBtn(); try { wireFlush(); } catch (e) {} } // the game shows someone else once you are dead
     // you (or the player you watch after you die), then everyone else in view
     const n = net(me), pos = isVec(n.pos) ? n.pos : me[K.pos] || { x: 0, y: 0 }, flags = (n.dead ? 1 : 0) | (n.downed ? 2 : 0) | (n.pan ? 8 : 0) | (n.heal ? 16 : 0) | (n.boost ? 32 : 0);
-    if (me.__id === myId && n.dead && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; diedAt = t; replayBtn(); }
+    if (me.__id === myId && n.dead && !wasDead) { wasDead = true; push(['D', t, 0, 0]); died = true; diedAt = t; replayBtn(); try { wireFlush(); } catch (e) {} }
     const ld = local(me), W = Array.isArray(ld.weaps) ? ld.weaps : [], ws = i => str(W[i] && W[i].type), wa = i => (W[i] && W[i].ammo) | 0, haveW = W.length >= 4 && typeof ld.cur === 'number';
     const meRec = [r2(pos.x), r2(pos.y), dir8(isVec(n.dir) ? n.dir : K.dir && me[K.dir]), me.layer | 0, r2(ld.hp), r2(ld.boost), haveW ? ld.cur | 0 : 0, haveW ? ws(0) : str(n.weap), wa(0), ws(1), wa(1), ws(2), ws(3), wa(3), str(n.helmet), str(n.chest), str(n.pack), str(ld.scope), r2(ld.zoom), n.anim | 0, n.action | 0, str(n.actItem), flags, 0, 0, r2(typeof n.scale === 'number' ? n.scale : 1), str(n.outfit)]; // 25 size, 26 outfit (a Tank is bigger and wears its own skin)
     const info = b.playerInfo || {}, mine = info[myId] || {}, players = [];
@@ -577,7 +601,7 @@
     for (const id of [...airSeen]) if (!airNow.has(id)) airSeen.delete(id);
     for (const pl of planeList(g)) { if (!pl || !pl.active || !isVec(pl.pos) || !isVec(pl.planeDir)) continue; const key = pl.id + '|' + (pl.actionComplete ? 1 : 0);
       if (planeSeen.get(pl.id) !== key) { planeSeen.set(pl.id, key); push(['Z', t, pl.id | 0, r2(pl.pos.x), r2(pl.pos.y), r4(pl.planeDir.x), r4(pl.planeDir.y), pl.type | 0, pl.actionComplete ? 1 : 0]); } }
-    for (const k of Object.keys(info)) { const nm = (info[k] || {}).name; if (typeof nm === 'string' && nm) names[k] = nm.slice(0, 24); } // for the replay tab only, never uploaded
+    for (const k of Object.keys(info)) { const nm = (info[k] || {}).name; if (typeof nm === 'string' && nm) names[k] = nm.slice(0, 24); } // for the replay tab only, never in the notes that are uploaded (the match copy is uploaded as the server sent it, part 3b)
     prune(t); if (died && !rpSnap && t - diedAt >= 2000) { rpSnap = rp.slice(); wireSnap = wireCut(); }
     const ids = Object.keys(info), sig = ids.join(','); if (sig !== infoSig) { infoSig = sig; push(['I', t, ids.map(k => [+k, (info[k] || {}).teamId | 0, (info[k] || {}).groupId | 0])]); }
     // obstacles: once when first seen (with their shape), then only when they change (broken, door opened, damaged)
@@ -609,6 +633,7 @@
   let token = null; try { token = localStorage.getItem('observer.token'); } catch (e) {}
   if (!token) { token = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(16).slice(2) + Date.now().toString(16)).replace(/[^a-f0-9-]/g, '').slice(0, 40); try { localStorage.setItem('observer.token', token); } catch (e) {} }
   let paused = false, sentBytes = 0, sending = false, lastError = '';
+  const playing = () => inMatch && !died && !hiding; // 1.8.1: alive in a match, nothing is uploaded (notes or match copy); it all goes at death, at the match's end, or when the tab goes away
   try { paused = localStorage.getItem('observer.paused') === '1'; } catch (e) {}
   async function zip(text) {
     if (typeof CompressionStream !== 'function') return { body: new TextEncoder().encode(text), enc: 'plain' };
@@ -616,7 +641,7 @@
   }
   const send = z => fetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Observer-Token': token, 'X-Observer-Encoding': z.enc, 'X-Observer-Version': VERSION }, body: z.body });
   async function flush() {
-    if (sending || !buf.length || paused) return; sending = true;
+    if (sending || !buf.length || paused || playing()) return; sending = true;
     // one batch: notes of one match only (its number goes in the header; a late tail of the last match sent under the next match's
     // number cost that match its start), and BATCH lines at most; the rest waits for the next send
     const m0 = buf[0][0]; let k = 0; while (k < buf.length && k < BATCH && buf[k][0] === m0) k++;
@@ -629,6 +654,46 @@
     } catch (e) { lastError = 'offline'; buf = part.concat(buf).slice(-KEEP); }
     sending = false; badge();
     if (!lastError && buf.length && (buf.length >= BATCH || buf[0][0] !== match || !inMatch)) setTimeout(flush, 5500); // a backlog: the next part soon (the server takes 12 a minute)
+  }
+
+  // ---------- 3b. the match copy (1.8.0) ----------
+  // So that a clip of a moment you flag can be shown in the game's own client on the clip jury, what the server sent your game is
+  // uploaded too, in chunks: the messages new since the last chunk, every 10 s and when the game's socket closes, zipped, in the format of
+  // the killcam's copy (a 4 byte time since the first message, a 0, a 4 byte length, the message). Nothing you send is in it. It holds
+  // what the server sends to every player, so the names of the players are in it as the game shows them. It goes to the observer's server
+  // only, is kept there privately until it is pulled, then deleted, and is never published as it is. A chunk that fails for good ends the
+  // upload of that match (the later chunks could not be read without it). Paused: nothing is uploaded, and the match is not picked up again.
+  const WIRE_URL = ENDPOINT.replace(/\/api\/upload$/, '/api/wire'), WIRE_CHUNK = 900000, WIRE_TRIES = 6, WIRE_PER_TICK = 6; let wireMatch = 0, hiding = false;
+  const wireDrop = w => { w.dead = true; const i = wires.indexOf(w); if (i >= 0) wires.splice(i, 1); };
+  async function zipBytes(bytes) { const s = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip')); return new Uint8Array(await new Response(s).arrayBuffer()); }
+  const hide = () => { hiding = document.visibilityState === 'hidden' || hiding; if (hiding) try { wireFlush(); } catch (e) {} }; // the tab is going away: what is left goes now (a small chunk with keepalive)
+  try { window.addEventListener('pagehide', () => { hiding = true; try { wireFlush(); } catch (e) {} }); document.addEventListener('visibilitychange', () => { hiding = document.visibilityState === 'hidden'; if (hiding) hide(); }); } catch (e) {}
+  function wireFlush() { for (const w of wires.slice()) wireSend(w).catch(() => { wireDrop(w); }); }
+  async function wireSend(w) {
+    if (w.busy || w.dead || playing()) return;
+    if (paused || typeof CompressionStream !== 'function') { wireDrop(w); return; }
+    if (!w.frames.length) { if (w.closed) wireDrop(w); return; }
+    if (!w.match) { if ((inMatch || w.closed) && match > wireMatch) w.match = wireMatch = match; else if (w.closed) { wireDrop(w); return; } else return; } // the match this socket carries: the one that began while it was open
+    w.busy = true;
+    try {
+      for (let k = 0; k < WIRE_PER_TICK && w.sent < w.frames.length; k++) {
+        let p = w.pend; // 1.8.0: a chunk is frozen at its first try (seq, frame count, bytes) and sent again as it was until it is taken: the server keeps the first one it got under a seq, so a chunk rebuilt bigger after a lost answer lost frames
+        if (!p) {
+          let n = 0, raw = 0; while (w.sent + n < w.frames.length && (!n || raw + 9 + w.frames[w.sent + n][1].byteLength <= WIRE_CHUNK)) raw += 9 + w.frames[w.sent + n++][1].byteLength;
+          const t0 = w.frames[0][0], body = new Uint8Array(raw), dv = new DataView(body.buffer); let o = 0;
+          for (let i = 0; i < n; i++) { const f = w.frames[w.sent + i], len = f[1].byteLength; dv.setUint32(o, Math.max(0, Math.round(f[0] - t0)) >>> 0, true); body[o + 4] = 0; dv.setUint32(o + 5, len, true); body.set(new Uint8Array(f[1]), o + 9); o += 9 + len; }
+          let q = '?sess=' + encodeURIComponent(sess) + '&match=' + w.match + '&seq=' + w.seq;
+          if (!w.seq) { let host = ''; try { host = new URL(w.url.replace(/^ws/, 'http')).host; } catch (e) {} q += '&m=' + encodeURIComponent(JSON.stringify({ openEpochMs: w.openEpoch, firstFrameEpochMs: w.firstEpoch, perfT0: t0, url: host, gitRevision: gitRev, v: VERSION })); }
+          p = w.pend = { seq: w.seq, n, q, z: await zipBytes(body) };
+        }
+        let res = null; const ka = (w.closed || hiding) && p.z.length <= 60000; // keepalive bodies are limited to 64 KB: a small last chunk survives the tab closing, a bigger one goes the usual way
+        try { res = await fetch(WIRE_URL + p.q, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-Observer-Version': VERSION }, body: p.z, keepalive: ka }); } catch (e) { res = null; }
+        if (res && res.ok) { w.sent += p.n; w.seq++; w.pend = null; w.fails = 0; sentBytes += p.z.length; continue; }
+        if (!res || res.status >= 500 || res.status === 429) { if (++w.fails > WIRE_TRIES) wireDrop(w); break; } // offline or busy: the same chunk, the same bytes, next time
+        wireDrop(w); break; // refused: the rest of this match is not sent
+      }
+      if (w.closed && w.sent >= w.frames.length) wireDrop(w);
+    } finally { w.busy = false; }
   }
 
   // ---------- 4. the game's id (signed-in players only) ----------
@@ -763,7 +828,7 @@
   function openKillcam(snap, lines) { // snap, lines: a saved clip's (part 5); none: the death's
     const s = snap || (lines ? null : wireSnap || (died ? wireCut() : null));
     if (!s || !s.frames.length || !s.death) { openReplay(lines); return; } // no copy of this match's socket (the observer started after it opened): the map replay
-    const w = window.open(location.origin + '/?u=' + encodeURIComponent(btoa(KC_URL)) + '&jt=vb', '_blank'); if (!w) return;
+    const w = window.open(location.origin + '/?vbkc=1', '_blank'); if (!w) return;
     kcSnap.set(w, s); while (kcSnap.size > 3) kcSnap.delete(kcSnap.keys().next().value);
   }
   window.__observerNotes = () => buf.map(r => r[1]); // tools/test-observer-wire.js: what was noted (nothing leaves the page in that test)
@@ -942,7 +1007,7 @@
 
   function loop() { try { tick(); } catch (e) {} requestAnimationFrame(loop); }
   requestAnimationFrame(loop);
-  setInterval(() => { flush(); badge(); gameIds(); }, FLUSH_MS);
+  setInterval(() => { flush(); try { wireFlush(); } catch (e) {} badge(); gameIds(); }, FLUSH_MS);
   setInterval(badge, 2000);
   setInterval(() => { try { replayBtn(); } catch (e) {} try { clipUi(); } catch (e) {} }, 400); // the game rebuilds its results panel and its Keybinds lists each time it shows them
   setInterval(clipTick, 250);
